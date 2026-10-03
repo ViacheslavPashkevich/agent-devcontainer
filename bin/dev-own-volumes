@@ -1,0 +1,129 @@
+#!/bin/sh
+#
+# Aligns the workspace's named-volume mount points with the dev user, once per
+# container create. See docs/development/setup.md.
+#
+# Why it exists: the devcontainer CLI remaps the dev user to the host user's UID
+# on Linux hosts that are not UID 1000, and that remap rewrites /etc/passwd and
+# chowns the home directory — and nothing else. A named volume takes its
+# ownership from the image, where the mount point is necessarily 1000:1000, so a
+# fresh node_modules volume on a remapped container belongs to a user that no
+# longer exists and pnpm cannot write it.
+#
+# Ownership is *read* unprivileged and root is borrowed only to repair, so on
+# macOS and on UID-1000 Linux hosts — where the remap never happens — this is a
+# silent no-op that never touches sudo.
+#
+# POSIX sh like bin/dev-agent and bin/dev-firewall, so the same suite can re-run
+# it under dash.
+
+set -u
+
+usage() {
+	printf '%s\n' \
+		'Usage: bin/dev-own-volumes' \
+		'' \
+		'  Reconciles the ownership of the workspace named-volume mount' \
+		'  points with the dev user, escalating through' \
+		'  /etc/sudoers.d/dev-own-volumes only when a repair is actually' \
+		'  needed. Idempotent: a converged mount point prints nothing.'
+}
+
+die() {
+	printf 'bin/dev-own-volumes: %s\n' "$1" >&2
+	exit 1
+}
+
+# The mount points, relative to the workspace root — the single source, like
+# ALLOWLIST in bin/dev-firewall. A new named volume inside the workspace is a
+# line here rather than a second sudoers grant.
+VOLUMES='node_modules'
+
+# The account the remap moves, and therefore the one the mount points must
+# follow. Named rather than numeric on purpose: 1000 is exactly the assumption
+# this script exists to stop making.
+OWNER=dev
+
+# No subcommands: there is one thing to do and it is the whole script. A stray
+# argument is a typo — most likely a subcommand borrowed from bin/dev-firewall —
+# so it is refused rather than ignored.
+if [ "$#" -gt 0 ]; then
+	case "$1" in
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		printf 'bin/dev-own-volumes: unknown argument: %s\n' "$1" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+fi
+
+# This script chowns directories and escalates to root, so it refuses to run
+# anywhere but inside the container. DEV_OWN_VOLUMES_SENTINEL is the test seam.
+[ -e "${DEV_OWN_VOLUMES_SENTINEL:-/.dockerenv}" ] ||
+	die 'not inside a container — this chowns directories as root and must never run on the host'
+
+# The workspace root is the primary checkout, resolved from this script's own
+# location exactly as bin/dev-firewall does it: a copy running out of
+# .worktrees/<branch>/bin must reconcile — and escalate — the *primary* copy,
+# which is the only path /etc/sudoers.d/dev-own-volumes names.
+script_dir=$(cd "$(dirname "$0")" && pwd -P) ||
+	die 'cannot resolve my own location'
+git_common=$(git -C "$script_dir" rev-parse --git-common-dir 2>/dev/null) &&
+	git_common=$(cd "$script_dir" && cd "$git_common" 2>/dev/null && pwd -P)
+if [ -n "${git_common:-}" ]; then
+	root=${git_common%/*}
+else
+	# Not a git checkout at all (a tarball copy); the script still sits in bin/.
+	root=$(cd "$script_dir/.." && pwd -P) ||
+		die 'cannot resolve the workspace root'
+fi
+
+# The passwd entry, which is what the CLI's remap rewrites — so this reads the
+# *effective* dev user rather than the 1000 the image was built with. Unknowable
+# ids are fatal: guessing them is how a repair chowns a volume to the wrong user.
+target_uid=$(id -u "$OWNER") && [ -n "$target_uid" ] ||
+	die "cannot read the $OWNER user's uid — the image is supposed to carry that account"
+target_gid=$(id -g "$OWNER") && [ -n "$target_gid" ] ||
+	die "cannot read the $OWNER user's gid — the image is supposed to carry that account"
+
+# The gate, per volume: does the mount point's own owner already match? Reading
+# that needs no privilege, which is what keeps the common create quiet and keeps
+# a pre-grant image working on the hosts that were never broken.
+needed=''
+for volume in $VOLUMES; do
+	dir=$root/$volume
+	# The parent is the writable bind mount, so seeding a missing mount point
+	# needs no root — and the fresh directory already belongs to the caller.
+	[ -d "$dir" ] || mkdir -p "$dir" || die "cannot create $dir"
+	owner=$(stat -c '%u:%g' "$dir") ||
+		die "cannot read the ownership of $dir"
+	[ "$owner" = "$target_uid:$target_gid" ] && continue
+	needed="$needed $volume"
+done
+
+[ -n "$needed" ] || exit 0
+
+# Escalate once for the whole run, not per volume. The grant is probed
+# separately from the run so a missing sudoers file and a chown that merely
+# failed are different diagnoses.
+if [ "$(id -u)" != 0 ]; then
+	sudo -n -l "$root/bin/dev-own-volumes" >/dev/null 2>&1 ||
+		die 'could not escalate — the image needs /etc/sudoers.d/dev-own-volumes; rebuild it with bin/dev-agent --rebuild'
+	exec sudo -n "$root/bin/dev-own-volumes"
+fi
+
+for volume in $needed; do
+	dir=$root/$volume
+	# Descendants first, the mount point itself last, so the gate above doubles
+	# as the completion marker: a run killed mid-chown leaves the top level
+	# unchanged and the next create repairs the rest instead of skipping it.
+	# -h so a symlink in a populated volume is retargeted, not followed out.
+	find "$dir" -mindepth 1 -exec chown -h "$OWNER:$OWNER" {} + ||
+		die "cannot chown the contents of $dir"
+	chown "$OWNER:$OWNER" "$dir" || die "cannot chown $dir"
+	printf 'owned: %s (%s, %s:%s)\n' "$volume" "$OWNER" "$target_uid" "$target_gid"
+done

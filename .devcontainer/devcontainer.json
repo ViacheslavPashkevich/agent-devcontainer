@@ -1,0 +1,16 @@
+{
+  "name": "BrandEasy",
+  "dockerComposeFile": "compose.yaml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/brandeasy",
+  "remoteUser": "dev",
+  // Runs again on every container recreate, against volumes that outlive the
+  // image — which is why both steps provision by reconciling and must stay
+  // idempotent. Ownership first and `&&`, not `;`: node_modules has to be
+  // writable before anything can touch it, and a failed chown should fail
+  // creation here rather than surface later as an unexplained `pnpm install`
+  // error. Relative paths — the string form runs in the workspace folder.
+  "postCreateCommand": "bin/dev-own-volumes && bin/dev-bootstrap",
+  // An editor detaching must never stop the compose project.
+  "shutdownAction": "none"
+}

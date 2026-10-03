@@ -1,0 +1,756 @@
+#!/usr/bin/env ruby
+#
+# First-run bootstrap for the devcontainer home: the container's
+# postCreateCommand, and re-runnable by hand at any time. It provisions
+# everything mechanical — into the home volume the herdr integrations for both
+# harnesses, git identity, the SSH identity and its client configuration, and
+# the harness permission posture; into the checkout the git-flow branch model —
+# and then reports every credential it cannot provision itself, each with the
+# command that fixes it. See docs/development/setup.md.
+#
+# Ruby, and container-only: the posture it writes is exactly what must never
+# reach a host, the image carries Ruby anyway, and the two structured-file edits
+# (a JSON merge and a TOML reconcile) are the whole job. Everything external —
+# herdr, git, codex — is a captured subprocess whose accepted exit statuses are
+# stated at the call site, so a failure can never be mistaken for "already
+# converged".
+
+require "fileutils"
+require "json"
+require "open3"
+require "yaml"
+
+USAGE = <<~TEXT.freeze
+  Usage: bin/dev-bootstrap [--doctor]
+
+    (no flags)  Provision the container home, then report credentials.
+                Exits non-zero only when provisioning itself failed:
+                a fresh machine is always missing the interactive
+                logins, and a postCreateCommand that fails over those
+                would fail container creation.
+    --doctor    Report only, writing nothing. Exits 1 when anything is
+                missing, 0 when the environment is ready.
+TEXT
+
+# A provisioning step's own diagnosis: the message it wants on stderr, plus the
+# detail (a subprocess's output, a parser's complaint) underneath it. Anything
+# else a step raises is unexpected, and the step's label describes it instead.
+class Failure < StandardError
+  attr_reader :detail
+
+  def initialize(message, detail = nil)
+    super(message)
+    @detail = detail
+  end
+end
+
+def die(message)
+  warn "bin/dev-bootstrap: #{message}"
+  exit 1
+end
+
+# run <argv…> — a captured subprocess: stdout, stderr, exit status. A missing
+# binary is a failed run (127, as a shell would report it), not a crash, so the
+# caller's status policy is the only thing that decides what it means.
+def run(*argv, **opts)
+  out, err, status = Open3.capture3(*argv, **opts)
+  [ out, err, status.exitstatus ]
+rescue Errno::ENOENT => e
+  [ "", e.message, 127 ]
+end
+
+def home
+  @home ||= ENV.fetch("HOME")
+end
+
+def claude_settings = File.join(home, ".claude", "settings.json")
+
+def codex_config = File.join(home, ".codex", "config.toml")
+
+def ssh_dir = File.join(home, ".ssh")
+
+def ssh_key = File.join(ssh_dir, "id_brandeasy")
+
+def ssh_config = File.join(ssh_dir, "config")
+
+# The two provider hosts this script owns, and the directives it writes for each.
+# The IdentityFile value is the literal tilde form: ssh expands it itself, and it
+# is what docs/development/setup.md tells the operator to look for.
+SSH_HOSTS = [ "github.com", "ssh.dev.azure.com" ].freeze
+SSH_KEY_LABEL = "~/.ssh/id_brandeasy"
+SSH_DIRECTIVES = {
+  "IdentityFile" => SSH_KEY_LABEL,
+  # Load-bearing, not hygiene: Azure DevOps accepts only the first key a client
+  # offers and fails the request outright when it is the wrong one, so a client
+  # walking its default identity list can fail against a registered key.
+  "IdentitiesOnly" => "yes"
+}.freeze
+
+# --- provisioning -----------------------------------------------------------
+#
+# Every step converges the keys it manages and writes only when the value would
+# change, which is what makes a second run a genuine no-op while still letting a
+# changed posture propagate onto an existing home volume.
+#
+# "Unchanged" is a plain early return, never an exit status: the shape this
+# replaces read a step's status 1 as "already converged", so an unwritable home
+# or a full disk reported success. Here anything a step raises fails the run.
+
+def prov_fail(message, detail = nil)
+  @prov_failed = true
+  warn "bin/dev-bootstrap: #{message}"
+  warn detail.chomp unless detail.nil? || detail.strip.empty?
+end
+
+def provisioned(what)
+  puts "provisioned: #{what}"
+end
+
+# step <failure message> — runs one provisioning step, catching everything. A
+# Failure carries its own wording; any other exception is unexpected — an
+# unwritable home, a full disk — and gets this step's message with the
+# exception underneath. Either way the run is marked failed and the remaining
+# steps still run.
+def step(failure_message)
+  yield
+rescue Failure => e
+  prov_fail(e.message, e.detail)
+rescue StandardError => e
+  prov_fail(failure_message, "#{e.class}: #{e.message}")
+end
+
+def install_integrations
+  # A failed probe is read as an empty status, so every install runs: the cost
+  # of guessing wrong is a wasted install, never a skipped one.
+  status, = run("herdr", "integration", "status")
+
+  [ "claude", "codex" ].each do |target|
+    # Only the literal "current" skips. Any other wording — not installed,
+    # outdated, a future rename — falls through to install, which is
+    # convergent. Installer output is captured, not streamed: probe and install
+    # chatter must not interleave with this script's own output.
+    next if status.lines.any? { |line| line.start_with?("#{target}: current") }
+
+    # herdr installs its state hook into the harness's own home directory and
+    # refuses when that directory is absent ("claude directory not found …
+    # install claude code first") — which is every fresh home volume, since no
+    # harness has run there yet. The directory is all it wants; the posture
+    # steps below fill it.
+    dir = File.join(home, ".#{target}")
+    begin
+      FileUtils.mkdir_p(dir)
+    rescue SystemCallError => e
+      prov_fail("could not create #{dir}", e.message)
+      next
+    end
+
+    out, err, code = run("herdr", "integration", "install", target)
+    if code != 0
+      prov_fail("herdr integration install #{target} failed", out + err)
+      next
+    end
+    provisioned "herdr integration (#{target})"
+  end
+end
+
+def claude_posture
+  path = claude_settings
+  want = "bypassPermissions"
+
+  # Merge, never author: herdr's integration registers its state hook under
+  # "hooks" in this same file, and the operator's own keys live here too.
+  data = {}
+  if File.exist?(path)
+    raw = File.read(path)
+    unless raw.strip.empty?
+      begin
+        data = JSON.parse(raw)
+      rescue JSON::ParserError => e
+        raise Failure.new(posture_failure("claude", path), "invalid JSON: #{e.message}")
+      end
+      unless data.is_a?(Hash)
+        raise Failure.new(posture_failure("claude", path), "not a JSON object")
+      end
+    end
+  end
+
+  permissions = data["permissions"]
+  permissions = {} unless permissions.is_a?(Hash)
+  return if permissions["defaultMode"] == want
+
+  permissions["defaultMode"] = want
+  data["permissions"] = permissions
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, JSON.pretty_generate(data) + "\n")
+  provisioned "claude permission posture (bypassPermissions)"
+end
+
+def codex_posture
+  path = codex_config
+  wants = {
+    "approval_policy" => '"never"',
+    "sandbox_mode" => '"danger-full-access"'
+  }
+
+  lines = File.exist?(path) ? File.readlines(path) : []
+  before = lines.dup
+
+  wants.each do |key, value|
+    want = "#{key} = #{value}\n"
+    # Line-based on the top-level region only: a key inside a [table] belongs
+    # to that table, and a top-level key has to stay above the first header —
+    # so appending at EOF is wrong the moment codex writes a table of its own.
+    top = lines.index { |line| line =~ /\A\s*\[/ } || lines.length
+    at = (0...top).find { |i| lines[i] =~ /\A\s*#{Regexp.escape(key)}\s*=/ }
+    if at
+      lines[at] = want unless lines[at] == want
+    else
+      lines.unshift(want)
+    end
+  end
+
+  return if lines == before
+
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, lines.join)
+  provisioned "codex permission posture (never, danger-full-access)"
+end
+
+def posture_failure(harness, path) = "could not write the #{harness} permission posture: #{path}"
+
+def identity_failure(key) = "could not set git #{key}"
+
+# git_get <args…> — a global-config read. 0 is a value, 1 is "no such key", and
+# anything else (128 on a malformed .gitconfig, say) is a failure: read as
+# absence it would seed over an operator's real configuration.
+def git_get(*args)
+  out, err, code = run("git", "config", "--global", *args)
+  case code
+  when 0 then out
+  when 1 then ""
+  else raise Failure.new("could not read git #{args.last}", err)
+  end
+end
+
+def git_set(message, *args)
+  _out, err, code = run("git", "config", "--global", *args)
+  raise Failure.new(message, err) unless code.zero?
+end
+
+# seed_identity <git key> <env var> — set-if-absent. Identity is the operator's,
+# so an existing value is never overwritten; the env variables are this
+# project's own convention, carried in the gitignored .devcontainer/.env.
+def seed_identity(key, env_var)
+  return unless git_get("--get", key).strip.empty?
+
+  value = ENV[env_var].to_s
+  return if value.empty?
+
+  git_set(identity_failure(key), key, value)
+  provisioned "git #{key}"
+end
+
+def allow_safe_directory
+  # Compared literally: '*' as --get-all's value pattern is an invalid regex
+  # and errors out. An unconditional --add would append a duplicate line on
+  # every run.
+  return if git_get("--get-all", "safe.directory").lines.any? { |line| line.chomp == "*" }
+
+  git_set("could not add safe.directory", "--add", "safe.directory", "*")
+  provisioned "git safe.directory ('*')"
+end
+
+# git-flow's branch model lives under `[gitflow]` in the repository's own
+# config, which no fresh clone carries — every `git flow` command refuses to
+# run until it is written (docs/development/git-workflow.md). bin/setup-gitflow
+# owns the model; this step only decides whether it runs, and the initialized
+# flag alone is that gate: reconciling key-by-key would rewrite an operator's
+# deliberate local tweak on every container create. Written to the primary
+# checkout, whose config every worktree shares — one write covers them all.
+def gitflow_configured?(root)
+  out, err, code = run("git", "-C", root, "config", "--local", "--get", "gitflow.initialized")
+  case code
+  when 0 then out.strip == "true"
+  when 1 then false
+  # git_get's policy again: a config that cannot be read must fail the step —
+  # read as absence it would seed over whatever is actually there.
+  else raise Failure.new("could not read gitflow.initialized", err)
+  end
+end
+
+def configure_gitflow(root)
+  return if gitflow_configured?(root)
+
+  _out, err, code = run(File.join(root, "bin", "setup-gitflow"), chdir: root)
+  raise Failure.new("could not configure git-flow: #{root}", err) unless code.zero?
+
+  provisioned "git-flow branch model"
+end
+
+def ssh_key_failure = "could not provision the ssh key: #{ssh_key}"
+
+# chmod_to <mode> <path> — converge one file mode, writing only when it would
+# change, so an already-converged home sees no write at all. It also repairs a
+# key that arrived with looser modes: the invariant is this script's, not
+# ssh-keygen's.
+def chmod_to(mode, path)
+  return if File.stat(path).mode & 0o7777 == mode
+
+  File.chmod(mode, path)
+end
+
+# The private key's existence alone gates generation: an existing key is never
+# regenerated or overwritten, whatever state it is in. A private key without its
+# public half is therefore left exactly as it is — the public half is derivable
+# (`ssh-keygen -y`), and the temp-then-rename below means this script can never
+# produce that state itself.
+def provision_ssh_key
+  FileUtils.mkdir_p(ssh_dir)
+  chmod_to(0o700, ssh_dir)
+
+  generate_ssh_key unless File.exist?(ssh_key)
+
+  chmod_to(0o600, ssh_key) if File.file?(ssh_key)
+end
+
+# Generated into a temporary pair and renamed, public half first: the private
+# key's existence is the convergence gate, so it must appear only once its pair
+# is complete. A crash between the two leaves only .provision files, which the
+# next run overwrites — a half-written pair can never read as converged. No
+# passphrase (-N ""): generation is non-interactive, an unattended agent cannot
+# answer a prompt, and an agent process holding the unlocked key would need
+# unlocking again after every container restart.
+def generate_ssh_key
+  tmp = "#{ssh_key}.provision"
+  out, err, code = run(
+    "ssh-keygen", "-t", "rsa", "-b", "4096", "-N", "",
+    "-C", "brandeasy-devcontainer", "-q", "-f", tmp
+  )
+  # Any non-zero status, 127 for a missing tool included, is a failure: a
+  # generator that failed or was interrupted must never read as convergence.
+  unless code.zero?
+    FileUtils.rm_f([ tmp, "#{tmp}.pub" ])
+    raise Failure.new(ssh_key_failure, out + err)
+  end
+
+  File.rename("#{tmp}.pub", "#{ssh_key}.pub")
+  File.rename(tmp, ssh_key)
+  provisioned "ssh key (#{SSH_KEY_LABEL}, RSA-4096)"
+end
+
+# ssh_host_block <lines> <host> — the index of the Host line this script manages
+# for that host, or nil. A managed block is one whose pattern list is exactly the
+# one host name: multi-pattern lines (`Host github.com gist.github.com`) and
+# wildcards (`Host *`) are somebody else's, and converging inside them would
+# alter hosts this script does not own.
+def ssh_host_block(lines, host)
+  lines.each_index.find do |i|
+    match = lines[i].chomp.match(/\A\s*Host[\s=]+(.*)\z/i)
+    match && match[1].split == [ host ]
+  end
+end
+
+# The block runs to the next Host/Match keyword line, or to EOF.
+def ssh_block_end(lines, at)
+  ((at + 1)...lines.length).find { |i| lines[i] =~ /\A\s*(Host|Match)[\s=]/i } || lines.length
+end
+
+def ssh_directive_value(line) = line.strip.split(/\s*=\s*|\s+/, 2)[1].to_s.strip
+
+# Converge only the two directives this script owns inside an existing managed
+# block — rewrite a differing value, insert a missing one under the Host line —
+# and leave every other directive in it alone.
+def converge_ssh_directives(lines, at)
+  changed = false
+  SSH_DIRECTIVES.each do |keyword, value|
+    stop = ssh_block_end(lines, at)
+    hit = ((at + 1)...stop).find { |i| lines[i] =~ /\A\s*#{keyword}[\s=]/i }
+    if hit
+      next if ssh_directive_value(lines[hit]) == value
+
+      lines[hit] = "  #{keyword} #{value}\n"
+    else
+      lines.insert(at + 1, "  #{keyword} #{value}\n")
+    end
+    changed = true
+  end
+  changed
+end
+
+# A missing block is inserted at the *top* of the file, which is load-bearing:
+# ssh accumulates IdentityFile values across every matching block in file order,
+# so a preceding operator `Host *` identity would otherwise be offered first —
+# exactly the Azure DevOps first-key failure these blocks exist to prevent.
+def insert_ssh_block(lines, host)
+  block = [ "Host #{host}\n" ] + SSH_DIRECTIVES.map { |keyword, value| "  #{keyword} #{value}\n" }
+  block << "\n" unless lines.empty? || lines.first == "\n"
+  lines.unshift(*block)
+  true
+end
+
+# Never writes StrictHostKeyChecking, UserKnownHostsFile or any known-hosts
+# content: the first-connection prompt is the operator's, and they are the one
+# able to compare the offered fingerprint against the provider's published one.
+def provision_ssh_config
+  lines = File.exist?(ssh_config) ? File.readlines(ssh_config) : []
+  changed = SSH_HOSTS.select do |host|
+    at = ssh_host_block(lines, host)
+    at ? converge_ssh_directives(lines, at) : insert_ssh_block(lines, host)
+  end
+
+  return if changed.empty?
+
+  FileUtils.mkdir_p(ssh_dir)
+  File.write(ssh_config, lines.join)
+  changed.each { |host| provisioned "ssh config (#{host})" }
+end
+
+def provision(root)
+  step("could not install the herdr integrations") { install_integrations }
+  step(posture_failure("claude", claude_settings)) { claude_posture }
+  step(posture_failure("codex", codex_config)) { codex_posture }
+  { "user.name" => "GIT_USER_NAME", "user.email" => "GIT_USER_EMAIL" }.each do |key, env_var|
+    step(identity_failure(key)) { seed_identity(key, env_var) }
+  end
+  step("could not add safe.directory") { allow_safe_directory }
+  # After safe.directory: on a host whose UID is not 1000 the checkout is
+  # "dubiously owned" until that write, and every git command in it fails.
+  step("could not configure git-flow") { configure_gitflow(root) }
+  step(ssh_key_failure) { provision_ssh_key }
+  step("could not provision the ssh client configuration: #{ssh_config}") { provision_ssh_config }
+end
+
+# --- doctor -----------------------------------------------------------------
+#
+# One stable, greppable line per check — `ok: <what>` or `missing: <what>`
+# followed by indented, copyable fix commands with <angle-bracket> placeholders
+# for the operator's own values. Probe output is redirected so this protocol is
+# the doctor's entire output.
+#
+# A finding is not a failure, so every probe here answers "missing" rather than
+# raising: a crashed codex or an unreadable .gitconfig is something to report.
+
+def check_ok(what)
+  puts "ok: #{what}"
+end
+
+def check_missing(what)
+  @doctor_missing = true
+  puts "missing: #{what}"
+end
+
+def fix(line)
+  puts "    #{line}"
+end
+
+def git_identity?
+  name, = run("git", "config", "--global", "--get", "user.name")
+  email, = run("git", "config", "--global", "--get", "user.email")
+  !name.strip.empty? && !email.strip.empty?
+end
+
+# ssh_probe_verdict <exit status> <combined output> → one of three outcomes:
+#
+#   :authenticated  the key reached the host and was accepted
+#   :unregistered   the host answered, and this key is not (yet) usable there
+#   :expired        the key is known but has decayed; the account needs a fresh
+#                   interactive web sign-in
+#
+# The whole point of this seam is that every provider-specific message pattern
+# lives here — the part most likely to accrete cases as provider wording changes,
+# and the part exercisable exhaustively without a network.
+#
+# The status alone cannot answer it: `ssh -T` against GitHub exits 1 on success,
+# and Azure DevOps refuses interactive shells with a non-zero status too, which
+# for this probe *is* success — the key authenticated and only a shell was denied.
+def ssh_probe_verdict(status, output)
+  return :authenticated if status.zero?
+  # Before the success patterns: Azure DevOps says this instead of authenticating.
+  return :expired if output =~ /key has expired/i
+  return :authenticated if output =~ /successfully authenticated/i
+  # Azure DevOps refuses the interactive shell in one of two ways: with its own
+  # "Shell access is not supported." message, or silently — in which case ssh
+  # reports the refusal itself as "shell request failed on channel 0" (observed
+  # against ssh.dev.azure.com with OpenSSH 10). Both mean the key authenticated:
+  # a rejected key is denied long before any shell is requested.
+  return :authenticated if output =~ /shell access is not supported/i
+  return :authenticated if output =~ /shell request failed/i
+
+  # Deliberately the catch-all — a public-key rejection, an unknown host key (the
+  # first connection was never made), a timeout, a DNS failure. All of them share
+  # one remedy, "register the key and connect once by hand", and the report stays
+  # honest for the network tail because the fix lines below open with the probe's
+  # own last diagnostic line.
+  :unregistered
+end
+
+# Where each provider takes the public key. Azure DevOps' page is also where its
+# server fingerprints are published, which is the value the operator compares.
+SSH_KEY_PAGES = {
+  "github.com" => "GitHub: Settings, then SSH and GPG keys",
+  "ssh.dev.azure.com" => "Azure DevOps: User settings, then SSH public keys (which also lists the server fingerprints)"
+}.freeze
+
+# BatchMode=yes is what makes this safe to run unattended on every container
+# creation: ssh can neither ask for a passphrase nor offer to accept a host key,
+# so the probe cannot write known_hosts and cannot block. ConnectTimeout bounds a
+# dead network. Output is captured, never streamed, so the doctor's protocol stays
+# its whole output.
+def check_ssh(host)
+  out, err, code = run("ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "git@#{host}")
+  output = out + err
+
+  case ssh_probe_verdict(code, output)
+  when :authenticated
+    check_ok "ssh #{host}"
+  when :expired
+    check_missing "ssh #{host}"
+    fix "the key is registered but has expired — Azure DevOps also requires a full"
+    fix "interactive web sign-in from time to time. Sign in, then re-run this check:"
+    fix "https://dev.azure.com/<organization>"
+    fix "if it stays expired, register a fresh key instead"
+  else
+    check_missing "ssh #{host}"
+    diagnostic = output.lines.map(&:strip).reject(&:empty?).last
+    fix diagnostic if diagnostic
+    fix "print the public key:"
+    fix "cat #{SSH_KEY_LABEL}.pub"
+    fix "register it at #{SSH_KEY_PAGES.fetch(host)}"
+    fix "then connect once by hand, comparing the fingerprint it offers against the"
+    fix "provider's published one before answering yes:"
+    fix "ssh -T git@#{host}"
+  end
+end
+
+# github_probe_verdict <exit status> <combined output> → one of three outcomes:
+#
+#   :valid        the token authenticated and the configured repository answered
+#   :rejected     github answered, and this token cannot be used for that
+#                 repository — expired, revoked, or scoped elsewhere
+#   :unreachable  no answer at all: a dead network, a missing gh, a killed probe
+#
+# The same seam as ssh_probe_verdict, for the same reason: the provider-specific
+# message patterns are the part most likely to accrete cases, and this way they
+# are exercisable exhaustively without a network.
+#
+# A fine-grained token scoped to another repository presents as 404 rather than
+# 403 — GitHub hides repositories a token cannot see — so the not-found status
+# belongs with the rejections, not with the network tail.
+def github_probe_verdict(status, output)
+  return :valid if status.zero?
+  return :rejected if output =~ /HTTP (401|403|404)|Bad credentials/i
+
+  # Deliberately the catch-all: timeout's 124, a missing gh as 127, a DNS
+  # failure, an outage. Its remedy is "check the network and the tooling", never
+  # "rotate the credential", so nothing that could be a real rejection may land
+  # here — hence the patterns above rather than a status-only test.
+  :unreachable
+end
+
+# The repository to probe and the name of the variable holding the token, read
+# from the *script's own* checkout: .claude/workflow.yml is committed and
+# therefore checkout-local, so a worktree adding a github: block has to answer
+# from its own copy — unlike the gitignored config/master.key, which only ever
+# exists in the primary checkout. Returns [[repository, token_env], nil] or
+# [nil, complaint]: an unreadable file is a finding to report, never a raise.
+def github_config(checkout)
+  path = File.join(checkout, ".claude", "workflow.yml")
+  block = YAML.safe_load_file(path)
+  block = block["github"] if block.is_a?(Hash)
+  return [ nil, "#{path} has no github: block" ] unless block.is_a?(Hash)
+
+  repository = block["repository"].to_s.strip
+  token_env = block["token_env"].to_s.strip
+  if repository.empty? || token_env.empty?
+    return [ nil, "#{path}: github: needs both repository and token_env" ]
+  end
+
+  [ [ repository, token_env ], nil ]
+rescue StandardError => e
+  [ nil, "could not read #{path}: #{e.class}: #{e.message}" ]
+end
+
+def check_github(checkout)
+  config, complaint = github_config(checkout)
+  unless config
+    check_missing "github token"
+    fix complaint
+    fix "the pull-request steps read the repository and the name of the token"
+    fix "variable from that block — restore it, then re-run this check"
+    return
+  end
+  repository, token_env = config
+
+  # No probe without a token: a bare fresh machine reports this offline, making
+  # no network call at all — the same shape as the AZURE_DEVOPS_PAT check.
+  if ENV[token_env].to_s.empty?
+    check_missing token_env
+    fix "create a fine-grained personal access token scoped to #{repository}"
+    fix "alone, with pull-request write and contents read, then add it to"
+    fix ".devcontainer/.env (gitignored):"
+    fix "#{token_env}=<token>"
+    fix "compose reads that file when the container is created, so a restart"
+    fix "is not enough — recreate the container, from the host:"
+    fix "devcontainer up --workspace-folder <checkout> --remove-existing-container"
+    return
+  end
+
+  # Bounded by `timeout`, because gh has no connect-timeout flag of its own and
+  # this runs inside postCreateCommand: an unbounded call on a dead network
+  # would hang container creation. Captured, never streamed, like every probe
+  # here. `gh` reads the token from the environment unprompted, so there is no
+  # login state to consult and nothing to provision.
+  out, err, code = run("timeout", "10", "gh", "api", "repos/#{repository}")
+  # Joined rather than concatenated: gh prints the error body on stdout without
+  # a trailing newline and its own complaint on stderr, so `out + err` welds the
+  # body's last character onto the front of the diagnostic line.
+  output = [ out, err ].reject { |part| part.strip.empty? }.join("\n")
+  diagnostic = output.lines.map(&:strip).reject(&:empty?).last
+
+  case github_probe_verdict(code, output)
+  when :valid
+    check_ok token_env
+  when :rejected
+    check_missing token_env
+    fix diagnostic if diagnostic
+    fix "the token was rejected — check that it is neither expired nor revoked,"
+    fix "and that it is scoped to #{repository} with pull-request write and"
+    fix "contents read, then replace it in .devcontainer/.env and recreate the"
+    fix "container, from the host:"
+    fix "devcontainer up --workspace-folder <checkout> --remove-existing-container"
+  else
+    # A killed probe can produce no output at all, hence the guard: the fix
+    # lines have to stand on their own.
+    check_missing token_env
+    fix diagnostic if diagnostic
+    fix "could not validate the token against github.com, which says nothing"
+    fix "about the token itself — check the network and that gh is installed,"
+    fix "then re-run this by hand:"
+    fix "gh api repos/#{repository}"
+  end
+end
+
+# root is the primary checkout (the gitignored config/master.key lives only
+# there); checkout is this script's own, for the committed files it reads.
+def doctor(root, checkout)
+  # No `claude login status` equivalent exists, so this is the credential
+  # store's path: inside the container that is always Linux, where claude
+  # writes the file (macOS would use the keychain).
+  if File.size?(File.join(home, ".claude", ".credentials.json"))
+    check_ok "claude auth"
+  else
+    check_missing "claude auth"
+    fix "log in once per home volume — start claude, then run /login:"
+    fix "claude"
+  end
+
+  if system("codex", "login", "status", out: File::NULL, err: File::NULL)
+    check_ok "codex auth"
+  else
+    check_missing "codex auth"
+    fix "log in once per home volume — the device flow, because the default"
+    fix "browser callback targets a container port nothing publishes:"
+    fix "codex login --device-auth"
+  end
+
+  if ENV["AZURE_DEVOPS_PAT"].to_s.empty?
+    check_missing "AZURE_DEVOPS_PAT"
+    fix "add it to .devcontainer/.env (gitignored):"
+    fix "AZURE_DEVOPS_PAT=<pat>"
+    fix "compose reads that file when the container is created, so a restart"
+    fix "is not enough — recreate the container, from the host:"
+    fix "devcontainer up --workspace-folder <checkout> --remove-existing-container"
+  else
+    check_ok "AZURE_DEVOPS_PAT"
+  end
+
+  check_github(checkout)
+
+  if File.file?(File.join(root, "config", "master.key"))
+    check_ok "config/master.key"
+  else
+    check_missing "config/master.key"
+    fix "copy it into the checkout (gitignored; bin/setup needs it) — scp is not"
+    fix "in the image, so this one runs from the host:"
+    fix "scp <other-machine>:<checkout>/config/master.key config/master.key"
+  end
+
+  if git_identity?
+    check_ok "git identity"
+  else
+    check_missing "git identity"
+    fix "set it here — the container home persists across rebuilds:"
+    fix 'git config --global user.name "<name>"'
+    fix 'git config --global user.email "<email>"'
+    fix "or, to provision it from the host, put both in .devcontainer/.env:"
+    fix "GIT_USER_NAME=<name>"
+    fix "GIT_USER_EMAIL=<email>"
+    fix "and recreate the container, from the host:"
+    fix "devcontainer up --workspace-folder <checkout> --remove-existing-container"
+  end
+
+  SSH_HOSTS.each { |host| check_ssh(host) }
+end
+
+# --- the run ----------------------------------------------------------------
+
+mode = :provision
+ARGV.each do |arg|
+  case arg
+  when "--doctor"
+    mode = :doctor
+  when "-h", "--help"
+    print USAGE
+    exit 0
+  else
+    warn "bin/dev-bootstrap: unknown argument: #{arg}"
+    warn USAGE
+    exit 2
+  end
+end
+
+# The posture this script writes is exactly what must never reach a host: run on
+# the bare host it would flip the operator's own claude and codex config to
+# permission bypass. Hence a sentinel rather than trust: /.dockerenv exists in
+# the container and nowhere else. DEV_BOOTSTRAP_SENTINEL is the test seam.
+sentinel = ENV["DEV_BOOTSTRAP_SENTINEL"].to_s
+sentinel = "/.dockerenv" if sentinel.empty?
+unless File.exist?(sentinel)
+  die "not inside a container — this provisions a container home with permission bypass and must never run on the host"
+end
+
+# The workspace root is the primary checkout, resolved from this script's own
+# location exactly as bin/dev-agent does it: a copy running out of
+# .worktrees/<branch>/bin must answer for the primary checkout, where the
+# gitignored config/master.key lives — a worktree never has its own copy, so a
+# script-dir-relative check would report a false "missing" from every worktree.
+# `git rev-parse --git-common-dir` prints a path relative to its own working
+# directory, so resolve it there.
+script_dir = __dir__ or die "cannot resolve my own location"
+common, _err, code = run("git", "-C", script_dir, "rev-parse", "--git-common-dir")
+git_common =
+  if code.zero? && !common.strip.empty?
+    begin
+      File.realpath(common.strip, script_dir)
+    rescue SystemCallError
+      nil
+    end
+  end
+# Not a git checkout at all (a tarball copy); the script still sits in bin/.
+root = git_common ? File.dirname(git_common) : File.expand_path("..", script_dir)
+
+# This script's own checkout, which is the worktree itself when it runs from
+# one: everything committed — .claude/workflow.yml — has to be read here rather
+# than in the primary checkout's copy of it.
+checkout = File.expand_path("..", script_dir)
+
+@prov_failed = false
+@doctor_missing = false
+
+provision(root) if mode == :provision
+doctor(root, checkout)
+
+# Missing credentials are findings, not failures: only provisioning can fail the
+# default run, and --doctor is the scriptable "is this environment ready".
+exit(@doctor_missing ? 1 : 0) if mode == :doctor
+exit(@prov_failed ? 1 : 0)

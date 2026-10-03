@@ -1,0 +1,80 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Default 0 keeps ordinary builds fully cached; exporting a fresh value
+      # re-runs the image's tool layers, which is how the floating tools move.
+      args:
+        TOOLS_EPOCH: ${TOOLS_EPOCH:-0}
+    # Long-lived no-op main process: the container outlives any attaching
+    # terminal. init reaps the zombies the process-heavy tooling leaves behind.
+    #
+    # Arming wraps it because this is the only hook that runs on *every* start —
+    # `docker restart` and a daemon restart bypass the devcontainer lifecycle
+    # hooks entirely, and bin/dev-agent's warm path never invokes them either.
+    # A failed arm still starts the container so the operator can attach and
+    # debug. The script installs a minimal deny before anything fallible runs,
+    # so every failure past that first restore leaves egress *closed*, not open;
+    # `bin/dev-firewall status` is the authority on what is actually enforced,
+    # which is why the message below reports rather than asserts.
+    command:
+      - sh
+      - -c
+      - >-
+        /workspaces/brandeasy/bin/dev-firewall on
+        || echo 'dev-firewall: arming failed — run bin/dev-firewall status to see what is enforced' >&2;
+        exec sleep infinity
+    init: true
+    # iptables, ipset and dnsmasq's set feeding need NET_ADMIN; NET_RAW is
+    # Docker's default but is named here so the fence's requirements are not
+    # split between this file and the daemon's defaults.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    shm_size: 2gb
+    volumes:
+      - ..:/workspaces/brandeasy
+      - home:/home/dev
+      # Native modules are platform-specific: sharing node_modules with the
+      # host over the bind mount leaves the container with darwin binaries.
+      - node-modules:/workspaces/brandeasy/node_modules
+    # Loopback only — nothing on the LAN reaches the dev servers.
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3036:3036"
+    environment:
+      # No database path: Rails merges host and credentials over database.yml,
+      # so development and test keep their own database names.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432
+      BINDING: "0.0.0.0"
+      VITE_RUBY_HOST: "0.0.0.0"
+    # Gitignored, optional: a fresh clone boots without it (the doctor reports
+    # the missing variables). `required` needs Docker Compose >= 2.24.
+    env_file:
+      - path: ./.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    # Postgres 18 moved the image's volume up a level: PGDATA now lives in a
+    # versioned subdirectory, so mounting /var/lib/postgresql/data would leave
+    # the data outside the volume.
+    volumes:
+      - pg-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  home:
+  node-modules:
+  pg-data:
