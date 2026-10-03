@@ -1,0 +1,4 @@
+# The template this .devcontainer/ was copied from, and the ref it was taken
+# at. A copy records the tag it took; upgrading is README.md, "Upgrading".
+repository: https://github.com/ViacheslavPashkevich/agent-devcontainer
+ref: main
