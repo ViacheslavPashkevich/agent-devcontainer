@@ -2,70 +2,53 @@
 #
 # The container's egress fence: default-deny outbound traffic with a
 # domain-based allowlist, armed by the compose command on every container start
-# and toggled by hand while debugging a blocked domain. See
-# docs/development/setup.md.
+# and toggled from the host while debugging a blocked domain. See README.md.
 #
-# The allowlist below is the single source for it — the dnsmasq and ulogd
-# configs are generated from it at arm time and tracked nowhere, so growing the
-# fence is: edit ALLOWLIST, run `bin/dev-firewall on`, commit.
+# Lives in the image at /usr/local/sbin/dev-firewall, root-owned: the sudoers
+# grant names that path, so nothing writable from inside the container can be
+# escalated. The allowlist is a separate file, /etc/dev-firewall/allowlist,
+# copied into the image from .devcontainer/firewall/allowlist and pushed live by
+# `devc firewall allow` — this script only ever reads it.
 #
 # Subcommands: on, off, status, rotate. The exhaust the fence produces — the
 # denial log, dnsmasq's query log and ulogd's own log — is rotated past LOG_MAX
 # with one generation kept, by a `rotate` the arm leaves running on a timer.
 #
-# POSIX sh like bin/dev-agent and bin/dev-bootstrap, so the same suite can
-# re-run it under dash. ruby appears once, for a DNS query against a named
-# server — the one thing getent cannot express.
+# POSIX sh like dev-own-volumes and devc, so the same suite can re-run it under
+# dash. dig appears once, for a DNS query against a named server — the one thing
+# getent cannot express.
 
 set -u
 
+# The program that runs is always the image copy, and this is the path the
+# sudoers grant names — so it is a constant, never discovered.
+SELF=/usr/local/sbin/dev-firewall
+
 usage() {
 	printf '%s\n' \
-		'Usage: bin/dev-firewall {on|off|status|rotate [--force]}' \
+		'Usage: dev-firewall {on|off|status|rotate [--force]}' \
 		'' \
 		'  on      Arm the fence: default-deny egress, allowlisted domains fed' \
 		'          into the ipset by the container-local resolver. Idempotent,' \
 		'          and how the container arms itself at start.' \
 		'  off     Lift enforcement, leaving the resolver and the logger up.' \
+		'          Root only: from the host, `devc firewall off`.' \
 		'  status  Report enforcement, resolver, logger and rotator liveness,' \
-		'          and the recent denials with the domains they were aimed at.' \
+		'          the allowlist, and the recent denials with the domains they' \
+		'          were aimed at.' \
 		'  rotate  Rotate any of the three fence logs that is past LOG_MAX,' \
 		'          keeping one generation. An arm leaves one of these running' \
 		'          on its own timer, so it is rarely run by hand; --force' \
-		'          rotates all three regardless of size.'
+		'          rotates all three regardless of size.' \
+		'' \
+		'The allowlist is /etc/dev-firewall/allowlist, one domain suffix per' \
+		'line. Add to it with `devc firewall allow <domain>` on the host.'
 }
 
 die() {
-	printf 'bin/dev-firewall: %s\n' "$1" >&2
+	printf 'dev-firewall: %s\n' "$1" >&2
 	exit 1
 }
-
-# Domain suffixes, not hostnames: dnsmasq matches every subdomain, so
-# `github.com` covers codeload and the raw hosts too. Deliberately no telemetry
-# endpoints — those are expected to surface in the denial log first and get
-# added from there, and most of them never earn it.
-#
-# The last two are Playwright's browser CDN and its direct-to-ESRP fallback —
-# both mirrors playwright-core will try, and the only hosts `playwright install`
-# reaches. bin/setup runs that install, so a container whose fence is armed
-# without them cannot provision a browser for system specs. Named host by host
-# rather than as `playwright.dev`, which would also open the trace viewer and
-# the docs site.
-ALLOWLIST='
-anthropic.com
-claude.ai
-openai.com
-chatgpt.com
-github.com
-githubusercontent.com
-dev.azure.com
-rubygems.org
-npmjs.org
-npmjs.com
-herdr.dev
-cdn.playwright.dev
-playwright.download.prss.microsoft.com
-'
 
 CHAIN=DEV_FIREWALL
 SET=dev-allowed
@@ -94,6 +77,7 @@ DENY_LOG=$R/var/log/dev-firewall.log
 DNS_LOG=$R/var/log/dev-firewall-dns.log
 ULOGD_LOG=$R/var/log/dev-firewall-ulogd.log
 PROC=$R/proc
+ALLOWLIST_FILE=$CONF_DIR/allowlist
 DNSMASQ_CONF=$CONF_DIR/dnsmasq.conf
 ULOGD_CONF=$CONF_DIR/ulogd.conf
 UPSTREAM_FILE=$CONF_DIR/upstream
@@ -113,7 +97,7 @@ while [ "$#" -gt 0 ]; do
 	case "$1" in
 	on | off | status | rotate)
 		[ -z "$action" ] || {
-			printf 'bin/dev-firewall: one subcommand at a time\n' >&2
+			printf 'dev-firewall: one subcommand at a time\n' >&2
 			usage >&2
 			exit 2
 		}
@@ -127,7 +111,7 @@ while [ "$#" -gt 0 ]; do
 		exit 0
 		;;
 	*)
-		printf 'bin/dev-firewall: unknown argument: %s\n' "$1" >&2
+		printf 'dev-firewall: unknown argument: %s\n' "$1" >&2
 		usage >&2
 		exit 2
 		;;
@@ -141,7 +125,7 @@ done
 }
 
 [ -z "$force" ] || [ "$action" = rotate ] || {
-	printf 'bin/dev-firewall: --force applies to rotate only\n' >&2
+	printf 'dev-firewall: --force applies to rotate only\n' >&2
 	usage >&2
 	exit 2
 }
@@ -152,39 +136,49 @@ done
 [ -e "${DEV_FIREWALL_SENTINEL:-/.dockerenv}" ] ||
 	die 'not inside a container — this rewrites /etc/resolv.conf and the OUTPUT chain and must never run on the host'
 
-# The workspace root is the primary checkout, resolved from this script's own
-# location exactly as bin/dev-agent does it: a copy running out of
-# .worktrees/<branch>/bin must escalate the *primary* copy, which is the only
-# path /etc/sudoers.d/dev-firewall names.
-script_dir=$(cd "$(dirname "$0")" && pwd -P) ||
-	die 'cannot resolve my own location'
-git_common=$(git -C "$script_dir" rev-parse --git-common-dir 2>/dev/null) &&
-	git_common=$(cd "$script_dir" && cd "$git_common" 2>/dev/null && pwd -P)
-if [ -n "${git_common:-}" ]; then
-	root=${git_common%/*}
-else
-	# Not a git checkout at all (a tarball copy); the script still sits in bin/.
-	root=$(cd "$script_dir/.." && pwd -P) ||
-		die 'cannot resolve the workspace root'
-fi
-
 # Every subcommand needs root — status too, because reading the OUTPUT chain
-# does. The single sudoers grant covers exactly this script.
+# does. The sudoers grant lists the subcommands it covers, argument by argument,
+# and `off` is not among them: lifting the fence is the host operator's, through
+# `devc firewall off`, which runs this as root directly. Everything the agent
+# identity can reach from inside is therefore armed, read-only or housekeeping.
 if [ "$(id -u)" != 0 ]; then
+	[ "$action" != off ] ||
+		die 'off is not granted inside the container — lift the fence from the host with `devc firewall off`'
 	# The grant is checked separately from the run, and the run is exec'd: a
 	# missing sudoers file and a subcommand that merely failed are different
 	# diagnoses, and only the first one is about escalation. exec also keeps the
 	# exit status and the signal semantics honest — `status | head` closing the
-	# pipe early must not read as a broken fence.
-	sudo -n -l "$root/bin/dev-firewall" >/dev/null 2>&1 ||
-		die 'could not escalate — the image needs /etc/sudoers.d/dev-firewall; rebuild it with bin/dev-agent --rebuild'
-	# The flag is forwarded rather than dropped: the smoke check runs as `dev`,
-	# and every subcommand escalates, so an unforwarded flag would be unreachable.
+	# pipe early must not read as a broken fence. `sudo -l` is asked about the
+	# exact argument vector, so a grant that stops covering a subcommand is
+	# reported here rather than as sudo's own password prompt.
 	if [ -n "$force" ]; then
-		exec sudo -n "$root/bin/dev-firewall" "$action" "$force"
+		sudo -n -l "$SELF" "$action" "$force" >/dev/null 2>&1 ||
+			die "could not escalate — the image needs /etc/sudoers.d/dev-firewall granting \`dev-firewall $action $force\`; rebuild it with \`devc rebuild\`"
+		exec sudo -n "$SELF" "$action" "$force"
 	fi
-	exec sudo -n "$root/bin/dev-firewall" "$action"
+	sudo -n -l "$SELF" "$action" >/dev/null 2>&1 ||
+		die "could not escalate — the image needs /etc/sudoers.d/dev-firewall granting \`dev-firewall $action\`; rebuild it with \`devc rebuild\`"
+	exec sudo -n "$SELF" "$action"
 fi
+
+# --- the allowlist ----------------------------------------------------------
+
+# One domain suffix per line; blank lines and `#` comments are ignored, and a
+# trailing comment on a domain line is stripped. Suffixes, not hostnames: dnsmasq
+# matches every subdomain, so `github.com` covers codeload and the raw hosts too.
+#
+# Read into ALLOWLIST, whitespace-separated, so the generator and the reports
+# iterate it the same way. A missing file is a broken image rather than an empty
+# fence — the Dockerfile copies the tracked file there — and an empty file is
+# refused too, because a fence with nothing allowed is never what an arm meant.
+read_allowlist() {
+	[ -f "$ALLOWLIST_FILE" ] ||
+		die "no allowlist at $ALLOWLIST_FILE — the image copies .devcontainer/firewall/allowlist there; rebuild it with \`devc rebuild\`"
+	ALLOWLIST=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$ALLOWLIST_FILE" |
+		grep -v '^$') || ALLOWLIST=''
+	[ -n "$ALLOWLIST" ] ||
+		die "the allowlist at $ALLOWLIST_FILE is empty — a fence with nothing allowed is a misconfiguration, not a posture"
+}
 
 # --- generated configuration ------------------------------------------------
 
@@ -195,8 +189,8 @@ ensure_dirs() {
 
 # The nameserver dnsmasq forwards to. Recorded on the first arm, because by the
 # second one /etc/resolv.conf already says 127.0.0.1 and the real upstream —
-# Docker's embedded DNS, which is what resolves `postgres` and every other
-# compose service — would be lost.
+# Docker's embedded DNS, which is what resolves every other compose service —
+# would be lost.
 upstream_server() {
 	if [ -s "$UPSTREAM_FILE" ]; then
 		cat "$UPSTREAM_FILE"
@@ -212,7 +206,7 @@ upstream_server() {
 write_dnsmasq_conf() {
 	{
 		printf '%s\n' \
-			'# Generated by bin/dev-firewall on every arm. Edit ALLOWLIST there.' \
+			"# Generated by dev-firewall on every arm from $ALLOWLIST_FILE." \
 			'no-resolv' \
 			"server=$1" \
 			'listen-address=127.0.0.1' \
@@ -236,7 +230,7 @@ write_ulogd_conf() {
 	[ -n "$plugins" ] || plugins=$R/usr/lib/ulogd
 	{
 		printf '%s\n' \
-			'# Generated by bin/dev-firewall on every arm.' \
+			'# Generated by dev-firewall on every arm.' \
 			'[global]' \
 			"logfile=\"$ULOGD_LOG\"" \
 			'loglevel=5'
@@ -314,9 +308,9 @@ resolver_gate() {
 # replaced in place by the full ruleset's own -F. The lo and conntrack accepts
 # are a strict prefix of both full rulesets, so the floor is never looser than
 # the intended posture — and without them a routine re-arm would RST the live
-# postgres and app connections the full ruleset preserves, and a wedged fence
-# would cut off the resolver on 127.0.0.1. No NFLOG rule: the logger is not up
-# yet at this point, so a denial during the floor window goes unlogged.
+# connections the full ruleset preserves, and a wedged fence would cut off the
+# resolver on 127.0.0.1. No NFLOG rule: the logger is not up yet at this point,
+# so a denial during the floor window goes unlogged.
 #
 # min_ruleset <reject-with> [<resolver address>] — the floor carries the resolver
 # gate too when it is given one, because a *failed* arm otherwise leaves the
@@ -410,7 +404,7 @@ drop_jump() {
 restore_floor() {
 	min_ruleset "$2" "$3" | "$1" --noflush && return 0
 	[ -n "$3" ] || return 1
-	printf 'bin/dev-firewall: %s refused the resolver gate; retrying the floor without it — the kernel may lack the owner match\n' \
+	printf 'dev-firewall: %s refused the resolver gate; retrying the floor without it — the kernel may lack the owner match\n' \
 		"$1" >&2
 	min_ruleset "$2" | "$1" --noflush
 }
@@ -443,14 +437,11 @@ daemon_alive() {
 
 # The probe queries 127.0.0.1 by name, which getent cannot do — it would answer
 # from whatever /etc/resolv.conf currently says, and the whole point is to check
-# dnsmasq *before* trusting it with resolv.conf.
+# dnsmasq *before* trusting it with resolv.conf. dig targets one server; +short
+# leaves only the answer, and the two timing flags bound a resolver that is up
+# but not answering.
 resolver_answers() {
-	ruby -rresolv -e '
-		Resolv::DNS.open(nameserver: ["127.0.0.1"]) do |dns|
-			dns.timeouts = 2
-			exit(dns.getaddresses(ARGV[0]).map(&:to_s).include?("127.0.0.1") ? 0 : 1)
-		end
-	' "$PROBE_NAME" >/dev/null 2>&1
+	[ "$(dig @127.0.0.1 +short +time=2 +tries=1 "$PROBE_NAME" 2>/dev/null)" = 127.0.0.1 ]
 }
 
 # --- log retention ----------------------------------------------------------
@@ -490,7 +481,7 @@ rotate_log() {
 	# so `: >file` would take the script down instead of reporting the one failure
 	# that leaves a log unbounded.
 	{ printf '' >"$1"; } 2>/dev/null || {
-		printf 'bin/dev-firewall: cannot truncate %s\n' "$1" >&2
+		printf 'dev-firewall: cannot truncate %s\n' "$1" >&2
 		return 1
 	}
 }
@@ -509,16 +500,16 @@ cmd_rotate() {
 
 # No cron and no systemd in this container, and `on` / `status` are far too rare
 # to rotate from, so the fence runs its own timer: one short-lived
-# `bin/dev-firewall rotate` a minute, i.e. exactly the code path an operator
-# gets. start-stop-daemon is what this script already stops its daemons with, so
-# the loop gets pid-file bookkeeping and fd detachment for free. The tick leads
-# and the sleep follows, so a fresh arm reclaims an oversized log from the
-# previous container life immediately.
+# `dev-firewall rotate` a minute, i.e. exactly the code path an operator gets.
+# start-stop-daemon is what this script already stops its daemons with, so the
+# loop gets pid-file bookkeeping and fd detachment for free. The tick leads and
+# the sleep follows, so a fresh arm reclaims an oversized log from the previous
+# container life immediately.
 start_rotator() {
 	stop_daemon "$ROTATE_PID" || die 'could not stop the running log rotator'
 	start-stop-daemon --start --quiet --background --make-pidfile \
 		--pidfile "$ROTATE_PID" --startas /bin/sh -- \
-		-c "while :; do \"$root/bin/dev-firewall\" rotate || exit 1; sleep $ROTATE_INTERVAL; done" ||
+		-c "while :; do \"$SELF\" rotate || exit 1; sleep $ROTATE_INTERVAL; done" ||
 		die "the log rotator failed to start — the fence's logs would grow unbounded"
 }
 
@@ -528,16 +519,19 @@ start_rotator() {
 # minimal REJECT floor installed before *anything* fallible runs — on a fresh
 # container as much as on a re-arm. Any failure past that first restore
 # therefore leaves egress *closed* — possibly stricter than intended, never
-# looser — and `bin/dev-firewall off` is the documented way out of a wedged
-# fence. The full ruleset replaces the floor in place through its own -F.
+# looser — and `devc firewall off` from the host is the documented way out of a
+# wedged fence. The full ruleset replaces the floor in place through its own -F.
 cmd_on() {
 	restore_floor iptables-restore icmp-port-unreachable "$DOCKER_RESOLVER" ||
-		die "iptables rejected the minimal deny — egress may be OPEN; check bin/dev-firewall status"
+		die "iptables rejected the minimal deny — egress may be OPEN; check dev-firewall status"
 	ensure_jump iptables
 	restore_floor ip6tables-restore icmp6-port-unreachable '' ||
-		die "ip6tables rejected the minimal deny — IPv6 may be OPEN (the IPv4 deny is in place); check bin/dev-firewall status"
+		die "ip6tables rejected the minimal deny — IPv6 may be OPEN (the IPv4 deny is in place); check dev-firewall status"
 	ensure_jump ip6tables
 
+	# After the floor, like everything fallible: a missing or empty allowlist
+	# leaves the container closed, never open.
+	read_allowlist
 	ensure_dirs
 	upstream=$(upstream_server) || die "cannot record the upstream nameserver in $UPSTREAM_FILE"
 	write_dnsmasq_conf "$upstream"
@@ -604,7 +598,7 @@ write_resolv() {
 	kept=$(grep -E '^[[:space:]]*(search|domain|options)[[:space:]]' "$RESOLV" 2>/dev/null) || kept=''
 	{
 		printf '%s\n' \
-			'# Written by bin/dev-firewall. Every name goes through the local' \
+			'# Written by dev-firewall. Every name goes through the local' \
 			'# dnsmasq, which feeds the allowlist ipset as it answers — a second' \
 			'# nameserver here would silently bypass that.' \
 			'nameserver 127.0.0.1'
@@ -696,8 +690,16 @@ cmd_status() {
 	# The fence supervises three daemons now, and this report is the authority on
 	# what is actually running: a silent third one would be the next lie.
 	daemon_line rotator "$ROTATE_PID"
-	set -- $ALLOWLIST
-	printf 'allowlist: %s\n' "$*"
+	# The file as it is now, which is what the next arm will enforce; a report
+	# cannot fail over it, so an unreadable or empty file is said rather than
+	# died over.
+	if [ -f "$ALLOWLIST_FILE" ]; then
+		listed=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$ALLOWLIST_FILE" |
+			grep -v '^$' | tr '\n' ' ')
+		printf 'allowlist: %s\n' "${listed:-(empty)}"
+	else
+		printf 'allowlist: (missing: %s)\n' "$ALLOWLIST_FILE"
+	fi
 
 	# tail before grep, so neither log's size shows up in this report's cost. The
 	# redirect is deliberate, not inherited: `status` on a never-armed container

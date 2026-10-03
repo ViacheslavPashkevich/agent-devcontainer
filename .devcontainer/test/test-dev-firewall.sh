@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# test-dev-firewall.sh — bin/dev-firewall's stub matrix: a fresh arm in order,
-# a convergent re-arm, every way an arm can fail without ever opening egress,
-# the toggle, the status report's annotation paths, the sudo re-exec, and the
-# host guard.
+# test-dev-firewall.sh — dev-firewall's stub matrix: a fresh arm in order, a
+# convergent re-arm, every way an arm can fail without ever opening egress, the
+# allowlist file, the toggle, the status report's annotation paths, the sudo
+# re-exec, and the host guard.
 #
 # Run it from anywhere, on the host: bash .devcontainer/test/test-dev-firewall.sh
 #
-# `bin/dev-firewall` is POSIX sh on purpose, and macOS /bin/sh is bash in POSIX
+# `dev-firewall` is POSIX sh on purpose, and macOS /bin/sh is bash in POSIX
 # mode — permissive enough to let a bashism through. Re-run the suite against
 # the strictest interpreter the shebang can land on to catch that:
 #
@@ -19,8 +19,8 @@
 #
 #   - DEV_FIREWALL_ROOT prefixes every absolute runtime path, so the whole
 #     script runs unprivileged inside a scratch world: /etc/resolv.conf, the
-#     logs, the pid-files and /proc are all fixtures under $ROOT.
-#   - `ruby` is a stub, not the safe bin's copy: here it is the subject's DNS
+#     allowlist, the logs, the pid-files and /proc are all fixtures under $ROOT.
+#   - `dig` is a stub, not the safe bin's copy: here it is the subject's DNS
 #     probe — network — rather than one of its utilities. The case bin precedes
 #     the safe bin on PATH, so the stub is what the subject resolves.
 #   - The iptables stub keeps jump state in a file, so `-C` answers honestly
@@ -29,6 +29,7 @@
 #     asserted against the real payload.
 
 SUBJECT=dev-firewall
+SUBJECT_PATH=.devcontainer/sbin/dev-firewall
 SUBJECT_SHELL_VAR=DEV_FIREWALL_SHELL
 # shellcheck source=.devcontainer/test/test-helper.sh
 . "$(dirname "${BASH_SOURCE[0]}")/test-helper.sh"
@@ -39,11 +40,29 @@ ROOT="$TMP/root"
 SENTINEL="$TMP/sentinel"
 : >"$SENTINEL"
 
+# The path the sudoers grant names and the rotator re-invokes: the image copy,
+# never the planted one — a constant in the subject, so a constant here.
+SELF=/usr/local/sbin/dev-firewall
+
 # The three daemons' pids are fixed so the fixtures and the assertions can name
 # them; the stubs plant $ROOT/proc/<pid> the way a live process would.
 DNSMASQ_PID_VALUE=4242
 ULOGD_PID_VALUE=4141
 ROTATE_PID_VALUE=4343
+
+# The allowlist as the image would carry it: comments, a blank line, a trailing
+# comment on a domain line, and a host-level entry — everything the parser has
+# to get right, and seven domains to count.
+ALLOWLIST_FIXTURE='# fixture allowlist
+anthropic.com
+claude.ai
+openai.com
+
+github.com   # source hosting
+npmjs.org
+herdr.dev
+playwright.download.prss.microsoft.com
+'
 
 # --- stubs ------------------------------------------------------------------
 
@@ -137,7 +156,7 @@ STUB
 # a pipeline, so logging first would race the `ip` calls that build it and make
 # the call order nondeterministic.
 #
-# An arm now feeds each family twice — the minimal deny floor, then the full
+# An arm feeds each family twice — the minimal deny floor, then the full
 # ruleset — so every payload is kept under its own ordinal alongside the
 # latest-wins file the ruleset_* helpers read. The failure knobs are selective
 # on both counts, because "the full v6 restore is the one that fails" is a
@@ -295,12 +314,16 @@ case "${2:-}" in
 esac
 STUB
 
-cat >"$STUBS/ruby" <<'STUB'
+# The probe. DIG_STUB_ANSWER is what it prints; the subject compares that against
+# the literal 127.0.0.1, so "dnsmasq answers something else" and "dnsmasq answers
+# nothing" are both one knob away.
+cat >"$STUBS/dig" <<'STUB'
 #!/bin/sh
 set -u
 S=${STUB_STATE:?}
-printf 'ruby (dns probe)\n' >>"$S/calls.log"
-exit "${RUBY_STUB_RC:-0}"
+printf 'dig %s\n' "$*" >>"$S/calls.log"
+printf '%s\n' "${DIG_STUB_ANSWER-127.0.0.1}"
+exit 0
 STUB
 
 chmod +x "$STUBS"/*
@@ -317,36 +340,38 @@ search internal.example
 options ndots:0'
 
 ALL_STUBS='id sudo ip ipset iptables ip6tables iptables-restore
-ip6tables-restore dnsmasq ulogd start-stop-daemon getent ruby'
+ip6tables-restore dnsmasq ulogd start-stop-daemon getent dig'
+
+CONF="$ROOT/etc/dev-firewall"
+RUN="$ROOT/run/dev-firewall"
+LOG_DIR="$ROOT/var/log"
+ALLOWLIST="$CONF/allowlist"
 
 reset_world() {
 	rm -rf "$STATE" "$ROOT"
-	mkdir -p "$STATE" "$ROOT/etc" "$ROOT/var/log" "$ROOT/run" "$ROOT/proc"
+	mkdir -p "$STATE" "$ROOT/etc" "$ROOT/var/log" "$ROOT/run" "$ROOT/proc" "$CONF"
 	# Discovered, not pinned: the subject globs the multiarch plugin directory,
 	# so the fixture has to look multiarch too.
 	mkdir -p "$ROOT/usr/lib/aarch64-linux-gnu/ulogd"
 	printf '%s\n' "$RESOLV_FIXTURE" >"$ROOT/etc/resolv.conf"
+	# The image's copy of the tracked allowlist.
+	printf '%s' "$ALLOWLIST_FIXTURE" >"$ALLOWLIST"
 	# shellcheck disable=SC2086
 	grant $ALL_STUBS
 	SENTINEL="$TMP/sentinel"
 	unset ID_STUB_UID SUDO_STUB_LIST_RC IPSET_STUB_FAIL RESTORE_STUB_FAIL \
 		RESTORE_STUB_FAIL_FULL RESTORE_STUB_FAIL_MIN \
 		DNSMASQ_STUB_TEST_FAIL DNSMASQ_STUB_START_FAIL ULOGD_STUB_FAIL \
-		SSD_STUB_FAIL RUBY_STUB_RC DEV_FIREWALL_LOG_MAX
+		SSD_STUB_FAIL DIG_STUB_ANSWER DEV_FIREWALL_LOG_MAX
 	OUT=''
 	ERR=''
 	RC=0
 }
 
-# runp [--from <checkout>] <args…> — the planted script with a hermetic PATH and
-# a scratch filesystem root.
+# runp <args…> — the planted script with a hermetic PATH and a scratch
+# filesystem root.
 runp() {
-	local from="$REPO"
-	if [ "${1:-}" = --from ]; then
-		from="$2"
-		shift 2
-	fi
-	capture --cd "$from" env -i \
+	capture --cd "$REPO" env -i \
 		PATH="$CASEBIN:$SAFEBIN" \
 		HOME="$TMP" \
 		STUB_STATE="$STATE" \
@@ -367,8 +392,8 @@ runp() {
 		${DNSMASQ_STUB_START_FAIL+DNSMASQ_STUB_START_FAIL="$DNSMASQ_STUB_START_FAIL"} \
 		${ULOGD_STUB_FAIL+ULOGD_STUB_FAIL="$ULOGD_STUB_FAIL"} \
 		${SSD_STUB_FAIL+SSD_STUB_FAIL="$SSD_STUB_FAIL"} \
-		${RUBY_STUB_RC+RUBY_STUB_RC="$RUBY_STUB_RC"} \
-		"$from/bin/dev-firewall" "$@"
+		${DIG_STUB_ANSWER+DIG_STUB_ANSWER="$DIG_STUB_ANSWER"} \
+		"$REPO/$SUBJECT_PATH" "$@"
 }
 
 ruleset() { cat "$STATE/ruleset-${1:-iptables-restore}.txt" 2>/dev/null; }
@@ -453,15 +478,16 @@ jumps_are() {
 	ok "${2:-iptables} OUTPUT holds $1 jump(s)"
 }
 
-CONF="$ROOT/etc/dev-firewall"
-RUN="$ROOT/run/dev-firewall"
-LOG_DIR="$ROOT/var/log"
-
-# The rotator the arm leaves behind: a `bin/dev-firewall rotate` a minute, run by
-# the same start-stop-daemon the script stops its daemons with. Named once here,
-# because the exact command line is what the call-log assertions pin.
-ROTATOR_START="start-stop-daemon --start --quiet --background --make-pidfile --pidfile $RUN/rotate.pid --startas /bin/sh -- -c while :; do \"$REPO/bin/dev-firewall\" rotate || exit 1; sleep 60; done"
+# The rotator the arm leaves behind: a `dev-firewall rotate` a minute, run by the
+# same start-stop-daemon the script stops its daemons with. Named once here,
+# because the exact command line is what the call-log assertions pin — including
+# that the loop re-invokes the *image* copy, not whatever file happened to run.
+ROTATOR_START="start-stop-daemon --start --quiet --background --make-pidfile --pidfile $RUN/rotate.pid --startas /bin/sh -- -c while :; do \"$SELF\" rotate || exit 1; sleep 60; done"
 ROTATOR_STOP="start-stop-daemon --stop --quiet --oknodo --retry TERM/5/KILL/5 --pidfile $RUN/rotate.pid --remove-pidfile"
+
+# The probe, pinned once: a single named server, the answer alone, and both
+# timing bounds — so a resolver that is up but silent cannot hang an arm.
+DIG_PROBE='dig @127.0.0.1 +short +time=2 +tries=1 dev-firewall.probe'
 
 # file_size_is <bytes> <path> — retention is about sizes, so they are asserted
 # rather than inferred from a grep. The arithmetic strips wc's padding.
@@ -473,13 +499,6 @@ file_size_is() {
 	ok "$(basename "$2"): $1 byte(s)"
 }
 
-file_mode_is() {
-	local m
-	m=$(stat -f %Lp "$2" 2>/dev/null || stat -c %a "$2")
-	[ "$m" = "$1" ] || die "$2 is mode $m, expected $1"
-	ok "$(basename "$2"): mode $1"
-}
-
 # ============================================================================
 # Arming
 # ============================================================================
@@ -488,7 +507,7 @@ case_start 'a fresh arm establishes the deny posture before the convenience laye
 reset_world
 runp on
 rc_is 0
-out_has 'enforcement: armed (13 domains allowlisted)'
+out_has 'enforcement: armed (7 domains allowlisted)'
 # The order *is* the fail-closed guarantee: the minimal deny and its jump land
 # per family before anything fallible runs at all, the full ruleset replaces the
 # floor in place, the daemons come after the rules, and resolv.conf is flipped
@@ -510,14 +529,13 @@ log_is \
 	"ulogd -d -c $CONF/ulogd.conf -p $RUN/ulogd.pid" \
 	"dnsmasq -C $CONF/dnsmasq.conf" \
 	"$ROTATOR_START" \
-	'ruby (dns probe)'
+	"$DIG_PROBE"
 jumps_are 1
 jumps_are 1 ip6tables
 
 case_start 'the deny floor lands before anything that can fail'
-# The ticket in one assertion: on a *fresh* container the first external call an
-# arm makes is the one that closes egress, so every failure after it is wedged
-# rather than open.
+# On a *fresh* container the first external call an arm makes is the one that
+# closes egress, so every failure after it is wedged rather than open.
 called_before 'iptables-restore --noflush' "dnsmasq --test -C $CONF/dnsmasq.conf"
 called_before 'iptables -I OUTPUT 1 -j DEV_FIREWALL' 'ipset create dev-allowed hash:ip -exist'
 called_before 'ip6tables -I OUTPUT 1 -j DEV_FIREWALL' 'ipset create dev-allowed hash:ip -exist'
@@ -526,8 +544,8 @@ restores_are 2 ip6tables-restore
 ok 'each family is fed the floor first and the full ruleset second'
 # Composition: a REJECT catch-all per family, over the same lo and conntrack
 # accepts the full rulesets open with — so the floor is never looser than the
-# posture it stands in for, and a re-arm's replace window never RSTs the live
-# postgres connection.
+# posture it stands in for, and a re-arm's replace window never RSTs a live
+# connection.
 min_ruleset_has '-A DEV_FIREWALL -o lo -j ACCEPT'
 min_ruleset_has '-A DEV_FIREWALL -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
 min_ruleset_has '-A DEV_FIREWALL -j REJECT --reject-with icmp-port-unreachable'
@@ -612,23 +630,33 @@ ruleset_has '-j REJECT --reject-with icmp6-port-unreachable' ip6tables-restore
 ruleset_hasnt '--match-set' ip6tables-restore
 ok 'no v6 allowlist: the compose network has no IPv6 to allow'
 
-case_start 'the generated dnsmasq config is the allowlist, and forwards to Docker'
+case_start 'the generated dnsmasq config is the allowlist file, and forwards to Docker'
 file_has "$CONF/dnsmasq.conf" 'no-resolv'
-# The upstream is Docker's embedded DNS, which is what resolves `postgres` —
-# fencing the database would be the first thing anyone noticed.
+# The upstream is Docker's embedded DNS, which is what resolves the other
+# compose services — fencing a project's database would be the first thing
+# anyone noticed.
 file_has "$CONF/dnsmasq.conf" 'server=127.0.0.11'
 file_has "$CONF/dnsmasq.conf" 'listen-address=127.0.0.1'
 file_has "$CONF/dnsmasq.conf" 'log-queries'
 file_has "$CONF/dnsmasq.conf" "log-facility=$ROOT/var/log/dev-firewall-dns.log"
 file_has "$CONF/dnsmasq.conf" 'address=/dev-firewall.probe/127.0.0.1'
-file_counts 13 "$CONF/dnsmasq.conf" '^ipset=/'
+file_counts 7 "$CONF/dnsmasq.conf" '^ipset=/'
 file_has "$CONF/dnsmasq.conf" 'ipset=/github.com/dev-allowed'
-file_has "$CONF/dnsmasq.conf" 'ipset=/rubygems.org/dev-allowed'
+file_has "$CONF/dnsmasq.conf" 'ipset=/npmjs.org/dev-allowed'
 file_has "$CONF/dnsmasq.conf" 'ipset=/anthropic.com/dev-allowed'
 file_has "$CONF/dnsmasq.conf" 'ipset=/herdr.dev/dev-allowed'
 # A host-level entry, not a suffix — proof the generator does not assume
 # two-label domains anywhere.
 file_has "$CONF/dnsmasq.conf" 'ipset=/playwright.download.prss.microsoft.com/dev-allowed'
+# The parser: the comment lines, the blank line and the trailing comment on
+# the github line all vanish, and the domain beside that comment survives.
+file_hasnt "$CONF/dnsmasq.conf" 'fixture allowlist'
+file_hasnt "$CONF/dnsmasq.conf" 'source hosting'
+file_counts 0 "$CONF/dnsmasq.conf" '^ipset=//'
+file_counts 0 "$CONF/dnsmasq.conf" '^ipset=/[^/]* '
+ok 'comments and blank lines in the allowlist produce no ipset lines'
+file_has "$CONF/dnsmasq.conf" "from $ALLOWLIST"
+ok 'the generated config names the file it was generated from'
 file_has "$CONF/upstream" '127.0.0.11'
 ok 'the displaced nameserver is recorded before resolv.conf is overwritten'
 
@@ -647,6 +675,10 @@ ok 'exactly one nameserver: a fallback would silently bypass the ipset feeding'
 file_hasnt "$ROOT/etc/resolv.conf" 'nameserver 127.0.0.11'
 file_has "$ROOT/etc/resolv.conf" 'search internal.example'
 file_has "$ROOT/etc/resolv.conf" 'options ndots:0'
+
+case_start 'the allowlist file is read, never written'
+file_is "$ALLOWLIST_FIXTURE" "$ALLOWLIST"
+ok 'the arm left the file byte-identical — the flow is repo to image to container, one way'
 
 case_start 'a second arm converges instead of stacking'
 : >"$STATE/calls.log"
@@ -674,6 +706,16 @@ ok 'a re-arm does not stack nameserver lines either'
 file_has "$CONF/upstream" '127.0.0.11'
 ok 'the upstream survives a re-arm, though resolv.conf no longer names it'
 
+case_start 'a re-arm picks up an allowlist pushed in since the last one'
+# `devc firewall allow` rewrites the file and re-arms; the generated config has
+# to follow the file, not a cached reading of it.
+printf '%s\n' 'example.net' >>"$ALLOWLIST"
+runp on
+rc_is 0
+out_has 'enforcement: armed (8 domains allowlisted)'
+file_has "$CONF/dnsmasq.conf" 'ipset=/example.net/dev-allowed'
+file_counts 8 "$CONF/dnsmasq.conf" '^ipset=/'
+
 case_start 'a non-loopback upstream is not a bypass, so the full ruleset gates nothing'
 reset_world
 # A host whose Docker hands out a routable nameserver instead of the embedded one:
@@ -693,13 +735,49 @@ ok 'the gate follows the recorded upstream, and the floor guards the embedded re
 # Every way an arm can fail leaves egress closed
 # ============================================================================
 
+case_start 'a missing allowlist stops the arm with the deny floor already down'
+reset_world
+rm -f "$ALLOWLIST"
+runp on
+rc_nonzero
+err_has "no allowlist at $ALLOWLIST"
+err_has 'devc rebuild'
+# The file is read after the floor, like everything fallible: a broken image
+# leaves the container closed, never open.
+log_is \
+	'iptables-restore --noflush' \
+	'iptables -C OUTPUT -j DEV_FIREWALL' \
+	'iptables -I OUTPUT 1 -j DEV_FIREWALL' \
+	'ip6tables-restore --noflush' \
+	'ip6tables -C OUTPUT -j DEV_FIREWALL' \
+	'ip6tables -I OUTPUT 1 -j DEV_FIREWALL'
+jumps_are 1
+jumps_are 1 ip6tables
+min_ruleset_has '-j REJECT --reject-with icmp-port-unreachable'
+no_file "$CONF/dnsmasq.conf"
+resolv_is_fixture
+ok 'closed and wedged, with nothing generated from a file that is not there'
+
+case_start 'an allowlist with nothing in it is refused the same way'
+reset_world
+printf '%s\n' '# nothing here' '' '   # or here' >"$ALLOWLIST"
+runp on
+rc_nonzero
+err_has "the allowlist at $ALLOWLIST is empty"
+jumps_are 1
+jumps_are 1 ip6tables
+no_file "$CONF/dnsmasq.conf"
+resolv_is_fixture
+ok 'a file of comments is empty, and empty is a misconfiguration rather than a posture'
+
 case_start 'a config dnsmasq rejects stops the arm with the deny floor already down'
 reset_world
 DNSMASQ_STUB_TEST_FAIL=1 runp on
 rc_nonzero
 err_has 'dnsmasq rejected the generated config'
 # The floor moves first, deliberately: the config check is the earliest fallible
-# step, and on a fresh container it used to exit with the chain still empty.
+# step after the allowlist read, and on a fresh container it would otherwise
+# exit with the chain still empty.
 log_is \
 	'iptables-restore --noflush' \
 	'iptables -C OUTPUT -j DEV_FIREWALL' \
@@ -742,13 +820,23 @@ resolv_is_fixture
 
 case_start 'a resolver that never answers leaves resolv.conf alone'
 reset_world
-RUBY_STUB_RC=1 runp on
+DIG_STUB_ANSWER='' runp on
 rc_nonzero
 err_has 'dnsmasq is not answering on 127.0.0.1'
 err_has 'leaving /etc/resolv.conf alone'
 jumps_are 1
 resolv_is_fixture
+called_times 5 "$DIG_PROBE"
 ok 'the probe is what gates the resolver flip, not the fact that dnsmasq started'
+
+case_start 'a resolver that answers the wrong thing is not trusted either'
+reset_world
+# Some other resolver on 127.0.0.1 answering the probe name from a wildcard:
+# whatever it is, it is not the dnsmasq feeding the ipset.
+DIG_STUB_ANSWER='10.0.0.1' runp on
+rc_nonzero
+err_has 'dnsmasq is not answering on 127.0.0.1'
+resolv_is_fixture
 
 case_start 'an ipset the kernel refuses names the missing capability'
 reset_world
@@ -808,9 +896,8 @@ resolv_is_fixture
 case_start 'a floor the kernel rejects is reported honestly rather than claimed closed'
 reset_world
 # The one fresh-container failure the script cannot close: there is no earlier
-# step to hide behind. A kernel that refuses a three-rule REJECT chain would
-# have refused every arm the old ordering did too — so the contract here is that
-# it says `may be OPEN` instead of pretending.
+# step to hide behind. The contract is that it says `may be OPEN` instead of
+# pretending.
 RESTORE_STUB_FAIL=1 runp on
 rc_nonzero
 err_has 'iptables rejected the minimal deny'
@@ -837,7 +924,7 @@ err_has 'grow unbounded'
 # failure state, not a degraded mode to arm into.
 jumps_are 1
 jumps_are 1 ip6tables
-not_called 'ruby (dns probe)'
+not_called 'dig'
 resolv_is_fixture
 
 case_start 'a floor that closes v4 but not v6 says which family is open'
@@ -942,8 +1029,8 @@ file_size_is 0 "$LOG_DIR/dev-firewall.log"
 ok 'copy-truncate: the generation holds the old bytes and the live file is emptied'
 # Truncated in place rather than renamed, because both daemons hold the file open
 # in append mode — and the mode has to survive, or the next reader cannot read it.
-file_mode_is 644 "$LOG_DIR/dev-firewall.log"
-file_mode_is 644 "$LOG_DIR/dev-firewall.log.1"
+mode_is 644 "$LOG_DIR/dev-firewall.log"
+mode_is 644 "$LOG_DIR/dev-firewall.log.1"
 no_file "$LOG_DIR/dev-firewall-dns.log.1"
 no_file "$LOG_DIR/dev-firewall-ulogd.log.1"
 file_size_is 10 "$LOG_DIR/dev-firewall-dns.log"
@@ -1041,7 +1128,11 @@ out_matches "^resolver: up \(pid $DNSMASQ_PID_VALUE\)$"
 out_matches "^logger: up \(pid $ULOGD_PID_VALUE\)$"
 out_matches "^rotator: up \(pid $ROTATE_PID_VALUE\)$"
 ok 'the third daemon the fence supervises is in the report too'
-out_has 'allowlist: anthropic.com claude.ai openai.com'
+# The allowlist as the file says it, comments and blanks dropped — what the
+# agent sees and cannot change.
+out_has 'allowlist: anthropic.com claude.ai openai.com github.com npmjs.org herdr.dev playwright.download.prss.microsoft.com'
+out_hasnt 'fixture allowlist'
+out_hasnt 'source hosting'
 out_has 'recent denials:'
 # Resolver correlation: dnsmasq's own query log knows which name produced it.
 out_matches '^  Aug 11 09:14:02  198\.51\.100\.4:443/TCP  telemetry\.example\.org$'
@@ -1060,10 +1151,9 @@ ok 'ports and protocols come from the log line, not from assumptions'
 out_matches '^  Aug 11 09:14:05  192\.0\.2\.99:\?/\?  \?$'
 out_matches '^  Aug 11 09:14:06  198\.51\.100\.4:443/TCP  telemetry\.example\.org$'
 ok 'a second denial to a known address is annotated from the same single pass'
-# The single-pass claim itself, which is the point of the rewrite: five denials,
-# one read of the DNS log. The previous shape re-scanned it once per denial.
+# The single-pass claim itself: five denials, one read of the DNS log.
 called_times 1 "$ROOT/var/log/dev-firewall-dns.log"
-ok "status's cost no longer grows with the size of the DNS log"
+ok "status's cost does not grow with the size of the DNS log"
 
 case_start 'status reports a wedged fence honestly'
 # Enforcement armed with the resolver dead is exactly what a failed arm leaves
@@ -1104,6 +1194,7 @@ out_has 'enforcement: off'
 out_has 'resolver: down'
 out_has 'logger: down'
 out_has 'rotator: down'
+out_has 'allowlist: anthropic.com'
 out_has 'no denials logged'
 # Not a word on stderr either: the logs do not exist yet, and a report that
 # complained about them would be the noise every container start begins with.
@@ -1112,41 +1203,73 @@ log_is \
 	'iptables -C OUTPUT -j DEV_FIREWALL' \
 	'ip6tables -C OUTPUT -j DEV_FIREWALL'
 ok 'no daemon is started and no rule is touched by a report'
-no_file "$CONF"
+no_file "$CONF/dnsmasq.conf"
 no_file "$RUN"
 resolv_is_fixture
+
+case_start 'status reports a missing or empty allowlist instead of dying over it'
+reset_world
+rm -f "$ALLOWLIST"
+runp status
+rc_is 0
+out_has "allowlist: (missing: $ALLOWLIST)"
+err_empty
+printf '# only comments\n' >"$ALLOWLIST"
+runp status
+rc_is 0
+out_has 'allowlist: (empty)'
+ok 'a report is a report — the arm is where a bad allowlist fails'
 
 # ============================================================================
 # Escalation
 # ============================================================================
 
-case_start 'a non-root run escalates through the one sudoers grant'
+case_start 'a non-root run escalates through the argument-scoped grant'
 reset_world
 ID_STUB_UID=1000 runp status
 rc_is 0
+# Asked of the exact vector, and of the image path: sudoers lists the subcommands
+# it grants, and the planted copy's own location is never what gets escalated.
 log_is \
-	"sudo -n -l $REPO/bin/dev-firewall" \
-	"sudo -n $REPO/bin/dev-firewall status"
+	"sudo -n -l $SELF status" \
+	"sudo -n $SELF status"
 ok 'nothing is attempted unprivileged first'
+not_called "$REPO"
+ok 'the path escalated is the image copy, not the file that ran'
 
 case_start 'a subcommand flag survives the escalation'
 reset_world
-# Every subcommand escalates, and the smoke check runs `rotate --force` as the
-# `dev` identity: a flag the re-exec dropped would be unreachable in the container.
+# Every granted subcommand escalates, and the smoke check runs `rotate --force`
+# as the `dev` identity: a flag the re-exec dropped would be unreachable.
 ID_STUB_UID=1000 runp rotate --force
 rc_is 0
 log_is \
-	"sudo -n -l $REPO/bin/dev-firewall" \
-	"sudo -n $REPO/bin/dev-firewall rotate --force"
+	"sudo -n -l $SELF rotate --force" \
+	"sudo -n $SELF rotate --force"
 
-case_start 'a worktree copy escalates the primary checkout, which is what sudoers names'
+case_start 'on escalates too — it is how the container arms itself at start'
 reset_world
-ID_STUB_UID=1000 runp --from "$WT" status
+ID_STUB_UID=1000 runp on
 rc_is 0
 log_is \
-	"sudo -n -l $REPO/bin/dev-firewall" \
-	"sudo -n $REPO/bin/dev-firewall status"
-ok 'the worktree path never appears — sudoers would not match it'
+	"sudo -n -l $SELF on" \
+	"sudo -n $SELF on"
+
+case_start 'off is refused to a non-root caller without asking sudo'
+reset_world
+runp on
+rc_is 0
+: >"$STATE/calls.log"
+ID_STUB_UID=1000 runp off
+rc_nonzero
+err_has 'off is not granted inside the container'
+err_has 'devc firewall off'
+# Not even the grant probe: the refusal is this script's own policy, not sudo's
+# answer, so an operator reading the message learns where `off` lives.
+log_empty
+jumps_are 1
+jumps_are 1 ip6tables
+ok 'enforcement stands — the agent identity cannot lift the fence'
 
 case_start 'a missing sudoers grant names the fix instead of the symptom'
 reset_world
@@ -1154,8 +1277,9 @@ SUDO_STUB_LIST_RC=1 ID_STUB_UID=1000 runp on
 rc_nonzero
 err_has 'could not escalate'
 err_has '/etc/sudoers.d/dev-firewall'
-err_has 'bin/dev-agent --rebuild'
-log_is "sudo -n -l $REPO/bin/dev-firewall"
+err_has 'granting `dev-firewall on`'
+err_has 'devc rebuild'
+log_is "sudo -n -l $SELF on"
 ok 'the grant is probed before the run, so a failing subcommand is not misreported'
 
 # ============================================================================
@@ -1173,7 +1297,7 @@ err_has 'not inside a container'
 err_has 'must never run on the host'
 log_empty
 resolv_is_fixture
-no_file "$CONF"
+no_file "$CONF/dnsmasq.conf"
 ok 'nothing on the host was touched'
 
 case_start 'the guard covers the read-only subcommand too'
@@ -1193,17 +1317,17 @@ reset_world
 runp --wat
 rc_is 2
 err_has 'unknown argument: --wat'
-err_has 'Usage: bin/dev-firewall'
+err_has 'Usage: dev-firewall'
 log_empty
-no_file "$CONF"
+no_file "$CONF/dnsmasq.conf"
 
 case_start 'no subcommand is a usage error, not a default action'
 reset_world
 runp
 rc_is 2
-err_has 'Usage: bin/dev-firewall'
+err_has 'Usage: dev-firewall'
 log_empty
-no_file "$CONF"
+no_file "$CONF/dnsmasq.conf"
 ok 'a bare invocation never arms or disarms anything'
 
 case_start '--force belongs to rotate alone'
@@ -1211,12 +1335,12 @@ reset_world
 runp status --force
 rc_is 2
 err_has '--force applies to rotate only'
-err_has 'Usage: bin/dev-firewall'
+err_has 'Usage: dev-firewall'
 log_empty
 ok 'a flag on the wrong subcommand is a usage error, not a silently ignored word'
 runp --force
 rc_is 2
-err_has 'Usage: bin/dev-firewall'
+err_has 'Usage: dev-firewall'
 log_empty
 
 case_start 'two subcommands at once are refused'
@@ -1230,10 +1354,11 @@ case_start '--help prints usage on stdout and runs nothing'
 reset_world
 runp --help
 rc_is 0
-out_has 'Usage: bin/dev-firewall'
+out_has 'Usage: dev-firewall'
 out_has 'Arm the fence'
+out_has 'devc firewall allow'
 log_empty
-no_file "$CONF"
+no_file "$CONF/dnsmasq.conf"
 ok 'help works outside the container too — it is the one thing that must'
 
 finish

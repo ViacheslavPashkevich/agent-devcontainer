@@ -1,44 +1,47 @@
 # shellcheck shell=bash
 #
-# test-helper.sh — the harness the three .devcontainer/test suites share.
+# test-helper.sh — the harness the four .devcontainer/test stub suites share.
 #
 # Sourced, never executed. A suite declares its subject and pulls this file in:
 #
-#   SUBJECT=dev-agent                    # bin/<SUBJECT> is the script under test
-#   SUBJECT_SHELL_VAR=DEV_AGENT_SHELL    # optional: env var that swaps the shebang
+#   SUBJECT=dev-firewall                         # the script's name
+#   SUBJECT_PATH=.devcontainer/sbin/dev-firewall # where it lives in the checkout
+#   SUBJECT_SHELL_VAR=DEV_FIREWALL_SHELL         # optional: env var that swaps the shebang
 #   . "$(dirname "${BASH_SOURCE[0]}")/test-helper.sh"
 #
-# It runs on the host (the agent and firewall suites) and inside the container
-# (the bootstrap suite), so everything here sticks to POSIX utilities plus bash.
+# Every suite runs on the host: the subjects are sh and python, both of which
+# the host baseline carries, and everything privileged or networked is a stub.
+# So this file sticks to POSIX utilities plus bash.
 #
 # What the helper owns: resolving the subject, the reporting protocol
 # (die/ok/case_start/finish), the scratch world under $TMP, the safe bin, the
-# scratch git checkouts, planting the subject into them, command capture, and
-# the generic assertion vocabulary.
+# scratch checkout, planting the subject into it, command capture, and the
+# generic assertion vocabulary.
 #
 # What a suite owns: its stubs, its own world extras ($HOMEDIR, $ROOT, …), its
 # `reset_world`, its `runp` (the cd and the hermetic `env -i` with its own stub
 # knobs, handed to `capture`), its fixtures, and its domain assertions.
 #
-# The harness follows .claude/scripts/test-prepare-common.sh — stub binaries
-# appending every invocation to one chronological call log, a `runp` that
-# captures stdout/stderr/status, and an assertion vocabulary the cases read like
-# prose. The subject is copied into a scratch git repo and invoked directly, so
-# its real shebang is what runs.
+# The shape: stub binaries appending every invocation to one chronological call
+# log, a `runp` that captures stdout/stderr/status, and an assertion vocabulary
+# the cases read like prose. The subject is copied into a scratch checkout and
+# invoked directly, so its real shebang is what runs.
 #
-# One deliberate divergence from the prior art: PATH is *replaced* per case
-# rather than prepended. "docker is not installed" has to be genuinely true, and
-# a host's own /usr/bin/docker leaking through would turn that case into a false
-# pass. Each case therefore gets a bin directory holding exactly the stubs it
-# grants, plus a farm of the system utilities the subject itself needs.
+# PATH is *replaced* per case rather than prepended. "docker is not installed"
+# has to be genuinely true, and a host's own /usr/bin/docker leaking through
+# would turn that case into a false pass. Each case therefore gets a bin
+# directory holding exactly the stubs it grants, plus a farm of the system
+# utilities the subject itself needs.
 
 set -u
 export LC_ALL=C
 
 : "${SUBJECT:?a suite must set SUBJECT before sourcing test-helper.sh}"
+: "${SUBJECT_PATH:?a suite must set SUBJECT_PATH before sourcing test-helper.sh}"
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-SRC=$(cd "$SCRIPT_DIR/../.." && pwd -P)/bin/$SUBJECT
+CHECKOUT=$(cd "$SCRIPT_DIR/../.." && pwd -P)
+SRC=$CHECKOUT/$SUBJECT_PATH
 [ -x "$SRC" ] || {
 	echo "not executable: $SRC" >&2
 	exit 1
@@ -84,7 +87,7 @@ STATE="$TMP/state"
 STUBS="$TMP/stubs"
 SAFEBIN="$TMP/safebin"
 CASEBIN="$TMP/casebin"
-REPO="$TMP/repo"
+REPO="$TMP/checkout"
 mkdir -p "$STATE" "$STUBS" "$SAFEBIN" "$CASEBIN"
 
 # File facts, across both `stat` dialects. They disagree on the flag *and* the
@@ -102,8 +105,8 @@ else
 	fmode() { stat -f %Lp "$1"; }
 fi
 
-# One whitelist for all three suites, deliberately: per-suite lists drifted, and
-# the copy that lost `uname` produced a suite that passed while the subject was
+# One whitelist for all the suites, deliberately: per-suite lists drift, and a
+# copy that loses `uname` produces a suite that passes while the subject is
 # failing to start. Link-if-present — a utility the host lacks is simply absent
 # from the safe bin and surfaces as "command not found" inside whichever case
 # actually uses it. `require_tools` is how a suite states a hard requirement.
@@ -111,8 +114,8 @@ fi
 # Widening the list cannot leak a subject's tool: stubs live in $CASEBIN, which
 # precedes $SAFEBIN on the hermetic PATH, and non-utilities (docker,
 # devcontainer, herdr, …) are never whitelisted, so "not installed" stays true.
-for util in git ruby grep sed awk tr cut tail head ls cat mkdir chmod rm sleep \
-	dirname printf wc date uname timeout; do
+for util in git python3 grep sed awk tr cut tail head ls cat mkdir chmod rm sleep \
+	dirname printf wc date uname timeout env sh; do
 	real=$(command -v "$util") && ln -sf "$real" "$SAFEBIN/$util"
 done
 
@@ -128,17 +131,17 @@ require_tools() {
 	done
 }
 
-# git builds the scratch checkouts below, so it is the helper's own requirement.
-require_tools git
-
 # --- planting ---------------------------------------------------------------
 
 # plant <checkout> — the script under test, at the location it has to answer
 # for. When the suite names a shell variable in SUBJECT_SHELL_VAR and that
 # variable is set, the shebang is swapped so the same cases can run under a
-# stricter interpreter than the host's /bin/sh.
+# stricter interpreter than the host's /bin/sh. A suite that defines
+# `plant_filter` (a filter from stdin to stdout) gets the copy passed through
+# it: that is how a list the real script leaves empty is given fixture entries.
 plant() {
-	mkdir -p "$1/bin"
+	local dest="$1/$SUBJECT_PATH"
+	mkdir -p "$(dirname "$dest")"
 	local shell_name=''
 	[ -n "${SUBJECT_SHELL_VAR:-}" ] && shell_name=${!SUBJECT_SHELL_VAR:-}
 	if [ -n "$shell_name" ]; then
@@ -147,33 +150,27 @@ plant() {
 			echo "no such shell: $shell_name" >&2
 			exit 1
 		}
-		sed "1s|.*|#!$shell_path|" "$SRC" >"$1/bin/$SUBJECT"
+		sed "1s|.*|#!$shell_path|" "$SRC" >"$dest.unfiltered"
 	else
-		cp "$SRC" "$1/bin/$SUBJECT"
+		cp "$SRC" "$dest.unfiltered"
 	fi
-	chmod +x "$1/bin/$SUBJECT"
+	if declare -F plant_filter >/dev/null; then
+		plant_filter <"$dest.unfiltered" >"$dest"
+	else
+		cp "$dest.unfiltered" "$dest"
+	fi
+	rm -f "$dest.unfiltered"
+	chmod +x "$dest"
 }
 
-# --- the scratch checkouts --------------------------------------------------
+# --- the scratch checkout ---------------------------------------------------
 
-git init -q "$REPO"
-git -C "$REPO" symbolic-ref HEAD refs/heads/main
-git -C "$REPO" config user.email test@example.com
-git -C "$REPO" config user.name 'Fixture Runner'
-git -C "$REPO" config commit.gpgsign false
+# A plain directory, not a git repository: nothing under test resolves anything
+# through git any more. The subject sits where it does in a real copy of the
+# template, so a script that derives a path from its own location is exercised.
+mkdir -p "$REPO"
 plant "$REPO"
 printf 'baseline\n' >"$REPO/README.md"
-git -C "$REPO" add -A
-git -C "$REPO" commit -q --no-verify -m 'Add baseline'
-
-# The worktree carries its own copy of the script through the commit above, so
-# the root-resolution cases exercise a real second checkout.
-WT="$REPO/.worktrees/feature-elsewhere"
-git -C "$REPO" worktree add -q -b feature/elsewhere "$WT" >/dev/null
-[ -x "$WT/bin/$SUBJECT" ] || {
-	echo "the worktree fixture has no bin/$SUBJECT" >&2
-	exit 1
-}
 
 # --- case plumbing ----------------------------------------------------------
 
@@ -239,6 +236,12 @@ out_has() {
 out_hasnt() {
 	printf '%s\n' "$OUT" | grep -qF -- "$1" && die "unexpected on stdout: $1"
 	ok "stdout lacks: $1"
+}
+
+out_empty() {
+	[ -z "$OUT" ] || die "expected no stdout, got:
+$OUT"
+	ok 'stdout is empty'
 }
 
 out_counts() {
@@ -332,9 +335,26 @@ file_counts() {
 	ok "$(basename "$2"): exactly $1 line(s) matching $3"
 }
 
+# file_is <content> <file> — whole-file equality. Both sides go through command
+# substitution so a trailing newline, which `cat` would strip from one side
+# only, cannot make identical files read as different.
+file_is() {
+	[ -f "$2" ] || die "no such file: $2"
+	[ "$(cat "$2")" = "$(printf '%s' "$1")" ] || die "$2 holds:
+$(cat "$2")
+expected:
+$1"
+	ok "$(basename "$2") holds exactly the expected content"
+}
+
 no_file() {
 	[ -e "$1" ] && die "should not exist: $1"
 	ok "not created: $1"
+}
+
+dir_exists() {
+	[ -d "$1" ] || die "no such directory: $1"
+	ok "directory exists: $1"
 }
 
 # mode_is <octal> <path> — a restrictive mode is a promise about the file on disk,

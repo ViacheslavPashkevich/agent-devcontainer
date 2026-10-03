@@ -1,0 +1,33 @@
+# Egress allowlist: one domain suffix per line. dnsmasq matches every subdomain,
+# so `github.com` covers codeload and the raw hosts too. Blank lines and `#`
+# comments are ignored.
+#
+# Copied into the image at /etc/dev-firewall/allowlist and enforced on every
+# container start. To add a domain without a restart, on the host:
+#
+#   devc firewall allow <domain>
+#
+# which appends here, pushes the file into the running container and re-arms.
+# Commit the change. Deliberately no telemetry endpoints: those surface in the
+# denial log first (`devc firewall status`), and most of them never earn a line.
+
+# The harnesses and their vendors.
+anthropic.com
+claude.ai
+openai.com
+chatgpt.com
+
+# Source hosting.
+github.com
+githubusercontent.com
+
+# Where the operator tools come from: the npm registry for claude and codex,
+# herdr's own installer.
+npmjs.org
+npmjs.com
+herdr.dev
+
+# Python packages: the baseline ships pip, and a fence that blocks the first
+# `pip install` is a trap.
+pypi.org
+pythonhosted.org
