@@ -343,6 +343,20 @@ v4_ruleset() {
 	[ -z "${1:-}" ] || resolver_gate "$1" icmp-port-unreachable --log
 	printf -- '-A %s -o lo -j ACCEPT\n' "$CHAIN"
 	printf -- '-A %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n' "$CHAIN"
+	# Docker's embedded resolver forwards to the host's nameservers *from inside
+	# this network namespace*, as root, whenever those servers are not a host
+	# loopback address (moby's resolver only uses the host namespace for
+	# 127.x upstreams). On a Linux host whose Docker is told `dns: [<bridge
+	# address>]`, or whose resolv.conf names the LAN router, every forwarded
+	# query would otherwise meet the catch-all and every name would SERVFAIL —
+	# the fence would close DNS itself. So uid 0 may speak DNS to anywhere:
+	# root inside the container is dnsmasq and that resolver, and nothing the
+	# dev identity can run reaches uid 0 beyond the two granted programs. The
+	# dev identity itself stays gated: its only resolver is the dnsmasq on
+	# 127.0.0.1. Above the gateway reject on purpose — on many hosts the
+	# nameserver *is* the gateway.
+	printf -- '-A %s -m owner --uid-owner 0 -p udp --dport 53 -j ACCEPT\n' "$CHAIN"
+	printf -- '-A %s -m owner --uid-owner 0 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN"
 	gateway=$(default_gateway)
 	if [ -n "$gateway" ]; then
 		nflog_rule " -d $gateway"
