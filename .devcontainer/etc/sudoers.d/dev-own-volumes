@@ -1,0 +1,3 @@
+# The volume repair, with no arguments: "" in sudoers means the command may be
+# run only with none.
+dev ALL=(root) NOPASSWD: /usr/local/sbin/dev-own-volumes ""

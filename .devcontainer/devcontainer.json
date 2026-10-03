@@ -1,16 +1,21 @@
 {
-  "name": "BrandEasy",
+  // Cosmetic: what editors show for the container. The one line in this file
+  // a project might want to change.
+  "name": "agent-devcontainer",
   "dockerComposeFile": "compose.yaml",
   "service": "app",
-  "workspaceFolder": "/workspaces/brandeasy",
+  // Fixed. Every engine script assumes it, and nothing inside the container
+  // needs the path to carry the project's name: each project has its own
+  // container and its own home volume.
+  "workspaceFolder": "/workspace",
   "remoteUser": "dev",
-  // Runs again on every container recreate, against volumes that outlive the
-  // image — which is why both steps provision by reconciling and must stay
-  // idempotent. Ownership first and `&&`, not `;`: node_modules has to be
-  // writable before anything can touch it, and a failed chown should fail
-  // creation here rather than surface later as an unexplained `pnpm install`
-  // error. Relative paths — the string form runs in the workspace folder.
-  "postCreateCommand": "bin/dev-own-volumes && bin/dev-bootstrap",
+  // Runs again on every container recreate, against a home volume that outlives
+  // the image — which is why both steps provision by reconciling and must stay
+  // idempotent. Ownership first and `&&`, not `;`: a project's named volumes
+  // have to be writable before anything can touch them, and a failed chown
+  // should fail creation here rather than surface later as an unexplained
+  // install error. Absolute paths: the login shell may reset PATH.
+  "postCreateCommand": "/usr/local/sbin/dev-own-volumes && /usr/local/bin/dev-bootstrap",
   // An editor detaching must never stop the compose project.
   "shutdownAction": "none"
 }

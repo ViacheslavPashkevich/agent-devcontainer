@@ -1,0 +1,4 @@
+# The fence. `on`, `status` and the two rotate forms; not `off`, which is the
+# host operator's through `devc firewall off`. Argument-scoped: sudoers matches
+# the command path and these exact argument vectors, nothing else.
+dev ALL=(root) NOPASSWD: /usr/local/sbin/dev-firewall on, /usr/local/sbin/dev-firewall status, /usr/local/sbin/dev-firewall rotate, /usr/local/sbin/dev-firewall rotate --force
