@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""
+First-run bootstrap for the devcontainer home: the container's
+postCreateCommand, and re-runnable by hand at any time. It provisions
+everything mechanical into the home volume — the operator tools (claude, codex,
+herdr), the herdr integrations for both harnesses, the harness permission
+posture, git identity, the SSH identity and its client configuration — and
+then reports every credential it cannot provision itself, each with the
+command that fixes it. See README.md.
+
+Python, standard library only, and container-only: the posture it writes is
+exactly what must never reach a host, python3 is baseline in the image, and
+the two structured-file edits (a JSON merge and a TOML reconcile) are the whole
+job. Everything external — npm, the herdr installer, herdr, git, codex, ssh — is
+a captured subprocess whose accepted exit statuses are stated at the call
+site, so a failure can never be mistaken for "already converged".
+
+Lives in the image at /usr/local/bin/dev-bootstrap. Runs as dev; nothing here
+needs root.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+USAGE = """\
+Usage: dev-bootstrap [--doctor | --update-tools]
+
+  (no flags)      Provision the container home, then report credentials.
+                  Exits non-zero only when provisioning itself failed:
+                  a fresh machine is always missing the interactive
+                  logins, and a postCreateCommand that fails over those
+                  would fail container creation.
+  --doctor        Report only, writing nothing. Exits 1 when anything is
+                  missing, 0 when the environment is ready.
+  --update-tools  Reinstall claude, codex and herdr at their current
+                  versions, then refresh the herdr integrations. No
+                  rebuild: the tools live in the home volume.
+"""
+
+
+class Failure(Exception):
+    """A provisioning step's own diagnosis: the message it wants on stderr,
+    plus the detail (a subprocess's output, a parser's complaint) underneath
+    it. Anything else a step raises is unexpected, and the step's label
+    describes it instead."""
+
+    def __init__(self, message, detail=None):
+        super().__init__(message)
+        self.detail = detail
+
+
+def die(message):
+    print(f"dev-bootstrap: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(*argv, env=None, cwd=None, stdin=None, timeout=None):
+    """(stdout, stderr, status). A missing program is 127, like a shell would
+    say, and a probe that overran its bound is 124, like `timeout` would."""
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
+            input=stdin,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        return "", f"{argv[0]}: {e.strerror}", 127
+    except subprocess.TimeoutExpired:
+        return "", f"{argv[0]}: timed out after {timeout}s", 124
+    return proc.stdout, proc.stderr, proc.returncode
+
+
+HOME = Path(os.environ["HOME"])
+LOCAL = HOME / ".local"
+LOCAL_BIN = LOCAL / "bin"
+CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
+CLAUDE_CREDENTIALS = HOME / ".claude" / ".credentials.json"
+CODEX_CONFIG = HOME / ".codex" / "config.toml"
+SSH_DIR = HOME / ".ssh"
+SSH_KEY = SSH_DIR / "id_devcontainer"
+SSH_CONFIG = SSH_DIR / "config"
+
+# The operator tools, and where they come from. The two harness CLIs share the
+# npm registry as their one channel; herdr has no packaged channel on Linux, so
+# its upstream installer is given a directory under the home. All three land in
+# ~/.local/bin, which the image puts on PATH.
+NPM_TOOLS = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
+HERDR_INSTALLER = "https://herdr.dev/install.sh"
+TOOLS = ("claude", "codex", "herdr")
+
+# The one provider host this script owns, and the directives it writes for it.
+# The IdentityFile value is the literal tilde form: ssh expands it itself, and
+# it is what the README tells the operator to look for.
+SSH_HOSTS = ["github.com"]
+SSH_KEY_LABEL = "~/.ssh/id_devcontainer"
+SSH_DIRECTIVES = {
+    "IdentityFile": SSH_KEY_LABEL,
+    # Offer this key and nothing else to the hosts this block names: a client
+    # walking its default identity list can be refused by a host that only
+    # accepts the first key it is shown.
+    "IdentitiesOnly": "yes",
+}
+
+# Where the provider takes the public key.
+SSH_KEY_PAGES = {"github.com": "GitHub: Settings, then SSH and GPG keys"}
+
+# --- provisioning -----------------------------------------------------------
+#
+# Every step converges the keys it manages and writes only when the value would
+# change, which is what makes a second run a genuine no-op while still letting a
+# changed posture propagate onto an existing home volume.
+#
+# "Unchanged" is a plain early return, never an exit status: the shape this
+# replaces read a step's status 1 as "already converged", so an unwritable home
+# or a full disk reported success. Here anything a step raises fails the run.
+
+prov_failed = False
+doctor_missing = False
+
+
+def prov_fail(message, detail=None):
+    global prov_failed
+    prov_failed = True
+    print(f"dev-bootstrap: {message}", file=sys.stderr)
+    if detail and detail.strip():
+        print(detail.rstrip("\n"), file=sys.stderr)
+
+
+def provisioned(what):
+    print(f"provisioned: {what}")
+
+
+def step(failure_message, fn, *args):
+    """Run one provisioning step, catching everything. A Failure carries its
+    own wording; any other exception is unexpected — an unwritable home, a
+    full disk — and gets this step's message with the exception underneath.
+    Either way the run is marked failed and the remaining steps still run."""
+    try:
+        fn(*args)
+    except Failure as e:
+        prov_fail(str(e), e.detail)
+    except Exception as e:  # noqa: BLE001 — the point is to catch everything
+        prov_fail(failure_message, f"{type(e).__name__}: {e}")
+
+
+def tool_present(name):
+    return shutil.which(name) is not None
+
+
+def tool_failure(names):
+    return "could not install the operator tools: " + ", ".join(names)
+
+
+def install_npm_tools():
+    # One npm call for both, with the prefix spelled out rather than trusted
+    # to the environment: the install has to land under the home whatever the
+    # caller's npm config says. npm's own output is captured, not streamed, so
+    # it cannot interleave with this script's protocol.
+    out, err, code = run(
+        "npm", "install", "-g", "--prefix", str(LOCAL), *NPM_TOOLS.values()
+    )
+    if code != 0:
+        raise Failure(tool_failure(NPM_TOOLS), out + err)
+
+
+def install_herdr():
+    # Downloaded to a file and then run, never piped: a curl that fails
+    # mid-stream would otherwise hand the shell half an installer. The
+    # installer is given its directory explicitly, so it never reaches for
+    # /usr/local or writes PATH advice into a dotfile.
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    fd, script = tempfile.mkstemp(prefix="herdr-install.", suffix=".sh")
+    os.close(fd)
+    try:
+        out, err, code = run("curl", "-fsSL", HERDR_INSTALLER, "-o", script)
+        if code != 0:
+            raise Failure(tool_failure(["herdr"]), out + err)
+        env = dict(os.environ, HERDR_INSTALL_DIR=str(LOCAL_BIN))
+        out, err, code = run("/bin/sh", script, env=env)
+        if code != 0:
+            raise Failure(tool_failure(["herdr"]), out + err)
+    finally:
+        try:
+            os.unlink(script)
+        except OSError:
+            pass
+
+
+def provision_tools(force=False):
+    """Install what is missing — or, with force, everything — and refuse to
+    call it done until the binaries are actually on PATH: an installer that
+    exits 0 having installed elsewhere is a failure, not a convergence."""
+    verb = "updated" if force else "provisioned"
+    npm_wanted = [t for t in NPM_TOOLS if force or not tool_present(t)]
+    if npm_wanted:
+        install_npm_tools()
+        absent = [t for t in NPM_TOOLS if not tool_present(t)]
+        if absent:
+            raise Failure(
+                tool_failure(absent),
+                f"npm reported success but {', '.join(absent)} did not appear on PATH — expected under {LOCAL_BIN}",
+            )
+        for t in npm_wanted:
+            print(f"{verb}: {t}")
+    if force or not tool_present("herdr"):
+        install_herdr()
+        if not tool_present("herdr"):
+            raise Failure(
+                tool_failure(["herdr"]),
+                f"the installer reported success but herdr did not appear on PATH — expected at {LOCAL_BIN / 'herdr'}",
+            )
+        print(f"{verb}: herdr")
+
+
+def install_integrations():
+    # A failed probe is read as an empty status, so every install runs: the
+    # cost of guessing wrong is a wasted install, never a skipped one.
+    status, _err, _code = run("herdr", "integration", "status")
+
+    for target in ("claude", "codex"):
+        # Only the literal "current" skips. Any other wording — not installed,
+        # outdated, a future rename — falls through to install, which is
+        # convergent.
+        if any(line.startswith(f"{target}: current") for line in status.splitlines()):
+            continue
+
+        # herdr installs its state hook into the harness's own home directory
+        # and refuses when that directory is absent — which is every fresh home
+        # volume, since no harness has run there yet. The directory is all it
+        # wants; the posture steps below fill it.
+        directory = HOME / f".{target}"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            prov_fail(f"could not create {directory}", str(e))
+            continue
+
+        out, err, code = run("herdr", "integration", "install", target)
+        if code != 0:
+            prov_fail(f"herdr integration install {target} failed", out + err)
+            continue
+        provisioned(f"herdr integration ({target})")
+
+
+def posture_failure(harness, path):
+    return f"could not write the {harness} permission posture: {path}"
+
+
+def claude_posture():
+    path = CLAUDE_SETTINGS
+    want = "bypassPermissions"
+
+    # Merge, never author: herdr's integration registers its state hook under
+    # "hooks" in this same file, and the operator's own keys live here too.
+    data = {}
+    if path.exists():
+        raw = path.read_text()
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise Failure(posture_failure("claude", path), f"invalid JSON: {e}")
+            if not isinstance(data, dict):
+                raise Failure(posture_failure("claude", path), "not a JSON object")
+
+    permissions = data.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+    if permissions.get("defaultMode") == want:
+        return
+
+    permissions["defaultMode"] = want
+    data["permissions"] = permissions
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    provisioned("claude permission posture (bypassPermissions)")
+
+
+def codex_posture():
+    path = CODEX_CONFIG
+    wants = {
+        "approval_policy": '"never"',
+        "sandbox_mode": '"danger-full-access"',
+    }
+
+    lines = path.read_text().splitlines(keepends=True) if path.exists() else []
+    before = list(lines)
+
+    for key, value in wants.items():
+        want = f"{key} = {value}\n"
+        # Line-based on the top-level region only: a key inside a [table]
+        # belongs to that table, and a top-level key has to stay above the
+        # first header — so appending at EOF is wrong the moment codex writes a
+        # table of its own. Python's stdlib reads TOML but does not write it,
+        # which is why this stays a line edit.
+        top = next((i for i, line in enumerate(lines) if re.match(r"\s*\[", line)), len(lines))
+        at = next(
+            (i for i in range(top) if re.match(r"\s*" + re.escape(key) + r"\s*=", lines[i])),
+            None,
+        )
+        if at is not None:
+            if lines[at] != want:
+                lines[at] = want
+        else:
+            lines.insert(0, want)
+
+    if lines == before:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(lines))
+    provisioned("codex permission posture (never, danger-full-access)")
+
+
+def identity_failure(key):
+    return f"could not set git {key}"
+
+
+def git_get(*args):
+    """A global-config read. 0 is a value, 1 is "no such key", and anything
+    else (128 on a malformed .gitconfig, say) is a failure: read as absence it
+    would seed over an operator's real configuration."""
+    out, err, code = run("git", "config", "--global", *args)
+    if code == 0:
+        return out
+    if code == 1:
+        return ""
+    raise Failure(f"could not read git {args[-1]}", err)
+
+
+def git_set(message, *args):
+    _out, err, code = run("git", "config", "--global", *args)
+    if code != 0:
+        raise Failure(message, err)
+
+
+def seed_identity(key, env_var):
+    """Set-if-absent. Identity is the operator's, so an existing value is never
+    overwritten; the env variables are this template's own convention, carried
+    in the gitignored .devcontainer/.env."""
+    if git_get("--get", key).strip():
+        return
+    value = os.environ.get(env_var, "")
+    if not value:
+        return
+    git_set(identity_failure(key), key, value)
+    provisioned(f"git {key}")
+
+
+def allow_safe_directory():
+    # Compared literally: '*' as --get-all's value pattern is an invalid regex
+    # and errors out. An unconditional --add would append a duplicate line on
+    # every run.
+    if any(line == "*" for line in git_get("--get-all", "safe.directory").splitlines()):
+        return
+    git_set("could not add safe.directory", "--add", "safe.directory", "*")
+    provisioned("git safe.directory ('*')")
+
+
+def ssh_key_failure():
+    return f"could not provision the ssh key: {SSH_KEY}"
+
+
+def chmod_to(mode, path):
+    """Converge one file mode, writing only when it would change, so an
+    already-converged home sees no write at all. It also repairs a key that
+    arrived with looser modes: the invariant is this script's, not
+    ssh-keygen's."""
+    if path.stat().st_mode & 0o7777 == mode:
+        return
+    path.chmod(mode)
+
+
+def provision_ssh_key():
+    """The private key's existence alone gates generation: an existing key is
+    never regenerated or overwritten, whatever state it is in. A private key
+    without its public half is therefore left exactly as it is — the public
+    half is derivable (`ssh-keygen -y`), and the temp-then-rename below means
+    this script can never produce that state itself."""
+    SSH_DIR.mkdir(parents=True, exist_ok=True)
+    chmod_to(0o700, SSH_DIR)
+
+    if not SSH_KEY.exists():
+        generate_ssh_key()
+
+    if SSH_KEY.is_file():
+        chmod_to(0o600, SSH_KEY)
+
+
+def generate_ssh_key():
+    """Generated into a temporary pair and renamed, public half first: the
+    private key's existence is the convergence gate, so it must appear only
+    once its pair is complete. A crash between the two leaves only .provision
+    files, which the next run overwrites — a half-written pair can never read
+    as converged. No passphrase (-N ""): generation is non-interactive, an
+    unattended agent cannot answer a prompt, and an agent process holding the
+    unlocked key would need unlocking again after every container restart."""
+    tmp = Path(f"{SSH_KEY}.provision")
+    out, err, code = run(
+        "ssh-keygen", "-t", "rsa", "-b", "4096", "-N", "",
+        "-C", "devcontainer", "-q", "-f", str(tmp),
+    )
+    # Any non-zero status, 127 for a missing tool included, is a failure: a
+    # generator that failed or was interrupted must never read as convergence.
+    if code != 0:
+        for leftover in (tmp, Path(f"{tmp}.pub")):
+            try:
+                leftover.unlink()
+            except FileNotFoundError:
+                pass
+        raise Failure(ssh_key_failure(), out + err)
+
+    Path(f"{tmp}.pub").rename(f"{SSH_KEY}.pub")
+    tmp.rename(SSH_KEY)
+    provisioned(f"ssh key ({SSH_KEY_LABEL}, RSA-4096)")
+
+
+def ssh_host_block(lines, host):
+    """The index of the Host line this script manages for that host, or None.
+    A managed block is one whose pattern list is exactly the one host name:
+    multi-pattern lines (`Host github.com gist.github.com`) and wildcards
+    (`Host *`) are somebody else's, and converging inside them would alter
+    hosts this script does not own."""
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*Host[\s=]+(.*)$", line.rstrip("\n"), re.IGNORECASE)
+        if m and m.group(1).split() == [host]:
+            return i
+    return None
+
+
+def ssh_block_end(lines, at):
+    """The block runs to the next Host/Match keyword line, or to EOF."""
+    for i in range(at + 1, len(lines)):
+        if re.match(r"\s*(Host|Match)[\s=]", lines[i], re.IGNORECASE):
+            return i
+    return len(lines)
+
+
+def ssh_directive_value(line):
+    parts = re.split(r"\s*=\s*|\s+", line.strip(), maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def converge_ssh_directives(lines, at):
+    """Converge only the directives this script owns inside an existing
+    managed block — rewrite a differing value, insert a missing one under the
+    Host line — and leave every other directive in it alone."""
+    changed = False
+    for keyword, value in SSH_DIRECTIVES.items():
+        stop = ssh_block_end(lines, at)
+        hit = next(
+            (i for i in range(at + 1, stop) if re.match(r"\s*" + keyword + r"[\s=]", lines[i], re.IGNORECASE)),
+            None,
+        )
+        if hit is not None:
+            if ssh_directive_value(lines[hit]) == value:
+                continue
+            lines[hit] = f"  {keyword} {value}\n"
+        else:
+            lines.insert(at + 1, f"  {keyword} {value}\n")
+        changed = True
+    return changed
+
+
+def insert_ssh_block(lines, host):
+    """A missing block is inserted at the *top* of the file, which is
+    load-bearing: ssh accumulates IdentityFile values across every matching
+    block in file order, so a preceding operator `Host *` identity would
+    otherwise be offered first."""
+    block = [f"Host {host}\n"] + [f"  {k} {v}\n" for k, v in SSH_DIRECTIVES.items()]
+    if lines and lines[0] != "\n":
+        block.append("\n")
+    lines[0:0] = block
+    return True
+
+
+def provision_ssh_config():
+    """Never writes StrictHostKeyChecking, UserKnownHostsFile or any
+    known-hosts content: the first-connection prompt is the operator's, and
+    they are the one able to compare the offered fingerprint against the
+    provider's published one."""
+    lines = SSH_CONFIG.read_text().splitlines(keepends=True) if SSH_CONFIG.exists() else []
+    changed = []
+    for host in SSH_HOSTS:
+        at = ssh_host_block(lines, host)
+        if (converge_ssh_directives(lines, at) if at is not None else insert_ssh_block(lines, host)):
+            changed.append(host)
+
+    if not changed:
+        return
+
+    SSH_DIR.mkdir(parents=True, exist_ok=True)
+    SSH_CONFIG.write_text("".join(lines))
+    for host in changed:
+        provisioned(f"ssh config ({host})")
+
+
+def provision():
+    step(tool_failure(TOOLS), provision_tools)
+    step("could not install the herdr integrations", install_integrations)
+    step(posture_failure("claude", CLAUDE_SETTINGS), claude_posture)
+    step(posture_failure("codex", CODEX_CONFIG), codex_posture)
+    for key, env_var in {"user.name": "GIT_USER_NAME", "user.email": "GIT_USER_EMAIL"}.items():
+        step(identity_failure(key), seed_identity, key, env_var)
+    step("could not add safe.directory", allow_safe_directory)
+    step(ssh_key_failure(), provision_ssh_key)
+    step(f"could not provision the ssh client configuration: {SSH_CONFIG}", provision_ssh_config)
+
+
+def update_tools():
+    step(tool_failure(TOOLS), provision_tools, True)
+    # The integrations are hooks installed into the harness homes by herdr, and
+    # a new herdr may install them differently — so a tool update refreshes
+    # them too.
+    step("could not install the herdr integrations", install_integrations)
+
+
+# --- doctor -----------------------------------------------------------------
+#
+# One stable, greppable line per check — `ok: <what>` or `missing: <what>`
+# followed by indented, copyable fix commands with <angle-bracket> placeholders
+# for the operator's own values. Probe output is redirected so this protocol is
+# the doctor's entire output.
+#
+# A finding is not a failure, so every probe here answers "missing" rather than
+# raising: a crashed codex or an unreadable .gitconfig is something to report.
+
+
+def check_ok(what):
+    print(f"ok: {what}")
+
+
+def check_missing(what):
+    global doctor_missing
+    doctor_missing = True
+    print(f"missing: {what}")
+
+
+def fix(line):
+    print(f"    {line}")
+
+
+def tool_version(name):
+    """The first line of `<tool> --version`, or nothing: a version is a
+    convenience in the report, never something the report can fail over."""
+    out, _err, code = run(name, "--version", timeout=10)
+    if code != 0:
+        return ""
+    first = next((line.strip() for line in out.splitlines() if line.strip()), "")
+    return first
+
+
+def check_tools():
+    for name in TOOLS:
+        if tool_present(name):
+            version = tool_version(name)
+            check_ok(f"{name} ({version})" if version else name)
+        else:
+            check_missing(name)
+            fix("the operator tools live in the home volume and the bootstrap installs them:")
+            fix("dev-bootstrap")
+
+
+def git_identity():
+    name, _, _ = run("git", "config", "--global", "--get", "user.name")
+    email, _, _ = run("git", "config", "--global", "--get", "user.email")
+    return bool(name.strip()) and bool(email.strip())
+
+
+def ssh_probe_verdict(status, output):
+    """One of three outcomes:
+
+      authenticated  the key reached the host and was accepted
+      unregistered   the host answered, and this key is not (yet) usable there
+      expired        the key is known but has decayed; the account needs a
+                     fresh interactive web sign-in
+
+    Every provider-specific message pattern lives here — the part most likely
+    to accrete cases as provider wording changes, and the part exercisable
+    exhaustively without a network. The status alone cannot answer it: `ssh -T`
+    against GitHub exits 1 on success."""
+    if status == 0:
+        return "authenticated"
+    if re.search(r"key has expired", output, re.IGNORECASE):
+        return "expired"
+    if re.search(r"successfully authenticated", output, re.IGNORECASE):
+        return "authenticated"
+    # Some providers refuse the interactive shell after authenticating, with a
+    # message of their own or with ssh's; a rejected key is denied long before
+    # any shell is requested.
+    if re.search(r"shell access is not supported|shell request failed", output, re.IGNORECASE):
+        return "authenticated"
+    # Deliberately the catch-all — a public-key rejection, an unknown host key
+    # (the first connection was never made), a timeout, a DNS failure. All of
+    # them share one remedy, "register the key and connect once by hand", and
+    # the report stays honest for the network tail because the fix lines open
+    # with the probe's own last diagnostic line.
+    return "unregistered"
+
+
+def check_ssh(host):
+    """BatchMode=yes is what makes this safe to run unattended on every
+    container creation: ssh can neither ask for a passphrase nor offer to
+    accept a host key, so the probe cannot write known_hosts and cannot block.
+    ConnectTimeout bounds a dead network."""
+    out, err, code = run("ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", f"git@{host}")
+    output = out + err
+    verdict = ssh_probe_verdict(code, output)
+    if verdict == "authenticated":
+        check_ok(f"ssh {host}")
+        return
+    check_missing(f"ssh {host}")
+    if verdict == "expired":
+        fix("the key is registered but has expired — the provider needs a fresh")
+        fix("interactive sign-in; sign in, then re-run this check, and if it stays")
+        fix("expired, register a fresh key instead")
+        return
+    diagnostic = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), None)
+    if diagnostic:
+        fix(diagnostic)
+    fix("print the public key:")
+    fix(f"cat {SSH_KEY_LABEL}.pub")
+    fix(f"register it at {SSH_KEY_PAGES[host]}")
+    fix("then connect once by hand, comparing the fingerprint it offers against the")
+    fix("provider's published one before answering yes:")
+    fix(f"ssh -T git@{host}")
+
+
+def doctor():
+    check_tools()
+
+    # No `claude login status` equivalent exists, so this is the credential
+    # store's path: inside the container that is always Linux, where claude
+    # writes the file (macOS would use the keychain).
+    if CLAUDE_CREDENTIALS.is_file() and CLAUDE_CREDENTIALS.stat().st_size > 0:
+        check_ok("claude auth")
+    else:
+        check_missing("claude auth")
+        fix("log in once per home volume — start claude, then run /login:")
+        fix("claude")
+
+    _out, _err, code = run("codex", "login", "status")
+    if code == 0:
+        check_ok("codex auth")
+    else:
+        check_missing("codex auth")
+        fix("log in once per home volume — the device flow, because the default")
+        fix("browser callback targets a container port nothing publishes:")
+        fix("codex login --device-auth")
+
+    if git_identity():
+        check_ok("git identity")
+    else:
+        check_missing("git identity")
+        fix("set it here — the container home persists across rebuilds:")
+        fix('git config --global user.name "<name>"')
+        fix('git config --global user.email "<email>"')
+        fix("or, to provision it from the host, put both in .devcontainer/.env:")
+        fix("GIT_USER_NAME=<name>")
+        fix("GIT_USER_EMAIL=<email>")
+        fix("and recreate the container, from the host:")
+        fix("devcontainer up --workspace-folder <checkout> --remove-existing-container")
+
+    for host in SSH_HOSTS:
+        check_ssh(host)
+
+
+# --- the run ----------------------------------------------------------------
+
+
+def main(argv):
+    mode = "provision"
+    for arg in argv:
+        if arg == "--doctor":
+            mode = "doctor"
+        elif arg == "--update-tools":
+            mode = "update-tools"
+        elif arg in ("-h", "--help"):
+            print(USAGE, end="")
+            return 0
+        else:
+            print(f"dev-bootstrap: unknown argument: {arg}", file=sys.stderr)
+            print(USAGE, end="", file=sys.stderr)
+            return 2
+    if "--doctor" in argv and "--update-tools" in argv:
+        print("dev-bootstrap: --doctor and --update-tools are mutually exclusive", file=sys.stderr)
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+
+    # The posture this script writes is exactly what must never reach a host:
+    # run on the bare host it would flip the operator's own claude and codex
+    # config to permission bypass. Hence a sentinel rather than trust:
+    # /.dockerenv exists in the container and nowhere else.
+    # DEV_BOOTSTRAP_SENTINEL is the test seam.
+    sentinel = os.environ.get("DEV_BOOTSTRAP_SENTINEL") or "/.dockerenv"
+    if not os.path.exists(sentinel):
+        die("not inside a container — this provisions a container home with permission bypass and must never run on the host")
+
+    if mode == "update-tools":
+        update_tools()
+        return 1 if prov_failed else 0
+
+    if mode == "provision":
+        provision()
+    doctor()
+
+    # Missing credentials are findings, not failures: only provisioning can fail
+    # the default run, and --doctor is the scriptable "is this environment ready".
+    if mode == "doctor":
+        return 1 if doctor_missing else 0
+    return 1 if prov_failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

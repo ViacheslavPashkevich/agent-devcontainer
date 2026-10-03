@@ -114,7 +114,7 @@ fi
 # Widening the list cannot leak a subject's tool: stubs live in $CASEBIN, which
 # precedes $SAFEBIN on the hermetic PATH, and non-utilities (docker,
 # devcontainer, herdr, …) are never whitelisted, so "not installed" stays true.
-for util in git python3 grep sed awk tr cut tail head ls cat mkdir chmod rm sleep \
+for util in git python3 grep sed awk tr cut tail head ls cat mkdir chmod rm ln sleep \
 	dirname printf wc date uname timeout env sh; do
 	real=$(command -v "$util") && ln -sf "$real" "$SAFEBIN/$util"
 done
@@ -242,6 +242,19 @@ out_empty() {
 	[ -z "$OUT" ] || die "expected no stdout, got:
 $OUT"
 	ok 'stdout is empty'
+}
+
+# out_has_line / out_hasnt_line — a whole line, exactly. For the lines where a
+# substring would also match a longer neighbour: `provisioned: claude` is a
+# prefix of `provisioned: claude permission posture`.
+out_has_line() {
+	printf '%s\n' "$OUT" | grep -qxF -- "$1" || die "expected stdout line: $1"
+	ok "stdout line: $1"
+}
+
+out_hasnt_line() {
+	printf '%s\n' "$OUT" | grep -qxF -- "$1" && die "unexpected stdout line: $1"
+	ok "stdout lacks the line: $1"
 }
 
 out_counts() {
