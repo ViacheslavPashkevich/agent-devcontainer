@@ -1,0 +1,426 @@
+#!/bin/sh
+#
+# devc — the host-side entry point to the agent devcontainer: start it, attach
+# to it, stop it, rebuild it, drive the egress fence, run a command inside, and
+# check the whole setup. Identical locally and over ssh to the host. See
+# README.md.
+#
+# One verb per invocation; flags only modify a verb; nothing privileged happens
+# implicitly. The two verbs that run as root inside the container — `firewall
+# off` and `firewall allow` — are the two things the agent identity inside must
+# not be able to do, which is why they live here and nowhere else.
+#
+# POSIX sh rather than anything richer: this is the one script that runs on the
+# bare host, where only Docker, the devcontainer CLI and a shell are promised.
+# Lives at .devcontainer/host/devc and is never copied into the image; a project
+# wanting a shorter path adds a shim in its own bin/.
+
+set -u
+
+# What `devc attach` (and the bare `devc`) runs inside the container. herdr is
+# the engine's choice: every project copied from this template is driven the
+# same way. A project that wants a plain shell instead changes this one line.
+ATTACH=herdr
+
+# Where the engine's own programs live in the image. Absolute, because the
+# container's login shell may reset PATH before any of these run.
+FIREWALL=/usr/local/sbin/dev-firewall
+BOOTSTRAP=/usr/local/bin/dev-bootstrap
+ALLOWLIST_IN_IMAGE=/etc/dev-firewall/allowlist
+
+usage() {
+	printf '%s\n' \
+		'Usage: devc [<verb> [<args>]]' \
+		'' \
+		'  devc                       up, then attach           (the daily path)' \
+		'  devc up                    start if not running, do not attach' \
+		'  devc attach                attach only; fails plainly if not running' \
+		'  devc stop                  stop the compose project, keep volumes' \
+		'' \
+		'  devc rebuild               rebuild the image from scratch, recreate the' \
+		'                             container, attach. Volumes survive.' \
+		'' \
+		'  devc firewall status       what is enforced, the allowlist, recent denials' \
+		'  devc firewall on           re-arm the fence' \
+		'  devc firewall off          lift enforcement (as root inside the container)' \
+		'  devc firewall allow <domain>' \
+		'                             append to .devcontainer/firewall/allowlist, push' \
+		'                             it into the running container, re-arm' \
+		'' \
+		'  devc exec <command...>     run a command inside, as the dev user' \
+		'  devc doctor                host prerequisites, then dev-bootstrap --doctor inside' \
+		'' \
+		'Updating claude, codex and herdr needs no rebuild:' \
+		'  devc exec dev-bootstrap --update-tools'
+}
+
+die() {
+	printf 'devc: %s\n' "$1" >&2
+	exit 1
+}
+
+usage_error() {
+	printf 'devc: %s\n' "$1" >&2
+	usage >&2
+	exit 2
+}
+
+# --- the verb ---------------------------------------------------------------
+
+verb=${1:-}
+[ "$#" -eq 0 ] || shift
+
+case "$verb" in
+'') verb=daily ;;
+up | attach | stop | rebuild | doctor) [ "$#" -eq 0 ] || usage_error "$verb takes no arguments" ;;
+firewall)
+	sub=${1:-}
+	[ -n "$sub" ] || usage_error 'firewall needs a subcommand: status, on, off, or allow <domain>'
+	shift
+	case "$sub" in
+	status | on | off) [ "$#" -eq 0 ] || usage_error "firewall $sub takes no arguments" ;;
+	allow)
+		[ "$#" -eq 1 ] || usage_error 'firewall allow takes exactly one domain'
+		domain=$1
+		;;
+	*) usage_error "unknown firewall subcommand: $sub" ;;
+	esac
+	;;
+exec) [ "$#" -gt 0 ] || usage_error 'exec needs a command to run' ;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*) usage_error "unknown verb: $verb" ;;
+esac
+
+# --- the checkout -----------------------------------------------------------
+
+# This script sits at .devcontainer/host/devc, so the project root — the folder
+# the devcontainer CLI labels the container with — is two levels up. Resolved
+# physically, because the label is the literal path `devcontainer up` was given.
+script_dir=$(cd "$(dirname "$0")" && pwd -P) ||
+	die 'cannot resolve my own location'
+root=$(cd "$script_dir/../.." && pwd -P) ||
+	die 'cannot resolve the project root from .devcontainer/host/'
+allowlist=$root/.devcontainer/firewall/allowlist
+
+# --- prerequisites ----------------------------------------------------------
+#
+# All read-only, so they re-run on every invocation — including the warm attach,
+# which still touches no container state. Ordered by dependency: each check's
+# diagnostic is only meaningful once the previous one passed. Two tiers, because
+# stopping and the fence verbs are pure docker: a missing devcontainer CLI must
+# never stand between the operator and freeing the host, or lifting a wedged
+# fence.
+
+need_docker() {
+	command -v docker >/dev/null 2>&1 ||
+		die 'Docker is not installed — install Docker Desktop (macOS) or docker-ce (Linux)'
+	# Only stdout is swallowed: a failing `docker info` also means socket
+	# permissions, a stale DOCKER_HOST or a bad context, and docker's own
+	# diagnostic is the part that says which.
+	docker info >/dev/null ||
+		die 'cannot connect to the Docker daemon — make sure Docker is running and your user can reach it'
+}
+
+# compose_version_ok — 0 when the Compose plugin is new enough, 1 with the
+# reason in COMPOSE_PROBLEM, 2 when the version string is unreadable (a warning,
+# not a refusal: `devcontainer up` still fails loudly if compose really is too
+# old). `env_file: required: false` in compose.yaml needs Compose >= 2.24; below
+# that the file fails validation inside `devcontainer up`, which names neither
+# the version nor the file.
+compose_version_ok() {
+	compose_version=$(docker compose version --short 2>/dev/null) || {
+		COMPOSE_PROBLEM='the Docker Compose plugin is missing — install Docker Compose >= 2.24 (Docker Desktop bundles it)'
+		return 1
+	}
+	compose_number=${compose_version#v}
+	compose_major=${compose_number%%.*}
+	compose_minor=${compose_number#*.}
+	compose_minor=${compose_minor%%[!0-9]*}
+	case "$compose_major:$compose_minor" in
+	'':* | *:'' | *[!0-9]*:* | *:*[!0-9]*)
+		# Versioning varies across distributions and Docker Desktop's own
+		# scheme (major 5 observed in the wild).
+		return 2
+		;;
+	esac
+	if [ "$compose_major" -lt 2 ] ||
+		{ [ "$compose_major" -eq 2 ] && [ "$compose_minor" -lt 24 ]; }; then
+		COMPOSE_PROBLEM="Docker Compose >= 2.24 required (found $compose_version) — update Docker"
+		return 1
+	fi
+	return 0
+}
+
+need_devcontainer() {
+	command -v devcontainer >/dev/null 2>&1 ||
+		die 'devcontainer CLI missing — npm install -g @devcontainers/cli'
+	compose_version_ok
+	case $? in
+	1) die "$COMPOSE_PROBLEM" ;;
+	2) printf 'devc: cannot read the Docker Compose version (%s); continuing\n' "$compose_version" >&2 ;;
+	esac
+}
+
+# --- the container ----------------------------------------------------------
+
+# The devcontainer CLI labels the container with the literal workspace path it
+# was given, which is the identity to probe. `docker ps` without -a already
+# means running only.
+running_id() {
+	docker ps -q --filter "label=devcontainer.local_folder=$root" ||
+		die 'docker ps failed — refusing to guess whether the container is running'
+}
+
+# require_running — the id, or a plain refusal: nothing here guesses at a
+# container that is not up.
+require_running() {
+	cid=$(running_id) || exit $?
+	# Word-splitting on purpose: keep the first id should stale duplicates
+	# exist (--remove-existing-container normally prevents that).
+	# shellcheck disable=SC2086
+	set -- $cid
+	cid=${1:-}
+	[ -n "$cid" ] || die 'the container is not running — start it with `devc up`'
+}
+
+# Streamed, not captured: a cold start is slow and the operator should see what
+# it is doing.
+start() {
+	devcontainer up --workspace-folder "$root" || exit $?
+}
+
+# attach — the harness TUI inside, exit status propagated: a detach is a 0 and
+# this script's 0. Not exec'd, so an exec failure can be explained: 126 and 127
+# are the shell's "cannot run" statuses, and the one way the attach command is
+# missing from a container built from this template is a bootstrap that did not
+# finish. No silent fallback to a shell — that would hide exactly that.
+attach() {
+	devcontainer exec --workspace-folder "$root" "$ATTACH"
+	rc=$?
+	case "$rc" in
+	126 | 127)
+		printf 'devc: `%s` is not available inside the container — the bootstrap did not finish. Shell in with `devc exec zsh`; diagnose with `devc doctor`.\n' \
+			"$ATTACH" >&2
+		;;
+	esac
+	exit "$rc"
+}
+
+# --- verbs ------------------------------------------------------------------
+
+cmd_daily() {
+	need_docker
+	need_devcontainer
+	cid=$(running_id) || exit $?
+	[ -n "$cid" ] || start
+	attach
+}
+
+cmd_up() {
+	need_docker
+	need_devcontainer
+	cid=$(running_id) || exit $?
+	if [ -n "$cid" ]; then
+		printf 'devc: already running\n'
+		exit 0
+	fi
+	start
+}
+
+cmd_attach() {
+	need_docker
+	need_devcontainer
+	require_running
+	attach
+}
+
+cmd_rebuild() {
+	need_docker
+	need_devcontainer
+	# No warm probe: the point is to recreate the container. That takes it out
+	# from under any other attached session, which is inherent to
+	# --remove-existing-container and true of the raw command this wraps.
+	devcontainer up --workspace-folder "$root" --remove-existing-container --build-no-cache || exit $?
+	attach
+}
+
+cmd_stop() {
+	need_docker
+	# Any state (-a): a stopped app container must still be found, because its
+	# labels are what name the environment. The compose project label on that
+	# container is the only authority — the project name is never recomputed
+	# from the checkout directory.
+	app=$(docker ps -aq --filter "label=devcontainer.local_folder=$root") ||
+		die 'docker ps failed — refusing to guess the environment state'
+	if [ -z "$app" ]; then
+		printf 'devc: nothing to stop — no devcontainer exists for %s\n' "$root"
+		exit 0
+	fi
+	# shellcheck disable=SC2086
+	set -- $app
+	app=$1
+	project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$app") ||
+		die 'docker inspect failed — cannot read the compose project label'
+	case "$project" in
+	'' | '<no value>')
+		# Go templates render an absent map key as either, depending on the
+		# path taken; both mean the label is not there. A hard error rather
+		# than a false "nothing running" while a project's services keep
+		# burning memory.
+		die "container $app carries no compose project label"
+		;;
+	esac
+	running=$(docker ps -q --filter "label=com.docker.compose.project=$project") ||
+		die 'docker ps failed — refusing to guess what is running'
+	if [ -z "$running" ]; then
+		printf 'devc: already stopped — no %s container is running\n' "$project"
+		exit 0
+	fi
+	# One id per line; splitting them into arguments is the intent. docker's
+	# own output is the confirmation, and its status propagates untouched.
+	# shellcheck disable=SC2086
+	docker stop $running || exit $?
+	exit 0
+}
+
+# The fence verbs go through docker exec rather than the devcontainer CLI: they
+# need to choose the identity — dev for what the grant covers, root for what it
+# deliberately does not — and the CLI offers no such choice.
+cmd_firewall_status() {
+	need_docker
+	require_running
+	exec docker exec -u dev "$cid" "$FIREWALL" status
+}
+
+cmd_firewall_on() {
+	need_docker
+	require_running
+	exec docker exec -u dev "$cid" "$FIREWALL" on
+}
+
+cmd_firewall_off() {
+	need_docker
+	require_running
+	exec docker exec -u root "$cid" "$FIREWALL" off
+}
+
+# A bare domain suffix: lowercase letters, digits, hyphens and dots, at least one
+# dot, no leading or trailing dot, no empty label. Anything else — a scheme, a
+# path, a wildcard — is refused with the shape spelled out, because a malformed
+# line would be committed and then rejected by every arm after it.
+valid_domain() {
+	case "$1" in
+	'' | .* | *. | *..* | *[!a-z0-9.-]*) return 1 ;;
+	*.*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# allowlisted <domain> — already a line of the tracked file, comments and
+# whitespace aside.
+allowlisted() {
+	sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$allowlist" |
+		grep -qxF -- "$1"
+}
+
+cmd_firewall_allow() {
+	valid_domain "$domain" ||
+		die "not a bare domain: $domain — give a suffix like example.com (no scheme, no path, no wildcard; lowercase)"
+	[ -f "$allowlist" ] || die "no allowlist at $allowlist"
+	if allowlisted "$domain"; then
+		printf 'devc: %s is already in %s\n' "$domain" "${allowlist#"$root/"}"
+	else
+		printf '%s\n' "$domain" >>"$allowlist" ||
+			die "cannot append to $allowlist"
+		printf 'devc: appended %s to %s — commit it\n' "$domain" "${allowlist#"$root/"}"
+	fi
+	need_docker
+	cid=$(running_id) || exit $?
+	if [ -z "$cid" ]; then
+		printf 'devc: the container is not running; the next start arms with the new list\n'
+		exit 0
+	fi
+	# shellcheck disable=SC2086
+	set -- $cid
+	cid=$1
+	# The whole file, not the one line: the image copy becomes exactly the
+	# tracked file, so a rebuild changes nothing the running container did not
+	# already have. Root, because the file is root-owned in the image and the
+	# dev identity must not be able to widen the fence.
+	docker exec -u root -i "$cid" sh -c "cat >$ALLOWLIST_IN_IMAGE" <"$allowlist" ||
+		die 'could not write the allowlist into the container'
+	exec docker exec -u root "$cid" "$FIREWALL" on
+}
+
+cmd_exec() {
+	need_docker
+	need_devcontainer
+	require_running
+	exec devcontainer exec --workspace-folder "$root" "$@"
+}
+
+# The doctor reports instead of dying: one `ok:`/`missing:` line per host
+# prerequisite, in the same protocol dev-bootstrap --doctor uses inside, so the
+# two halves read as one report. Exit 1 on any finding.
+cmd_doctor() {
+	findings=0
+	if command -v docker >/dev/null 2>&1; then
+		printf 'ok: docker\n'
+		if docker info >/dev/null 2>&1; then
+			printf 'ok: docker daemon\n'
+		else
+			printf 'missing: docker daemon\n    make sure Docker is running and your user can reach it (docker info)\n'
+			findings=1
+		fi
+	else
+		printf 'missing: docker\n    install Docker Desktop (macOS) or docker-ce (Linux)\n'
+		printf 'missing: docker daemon\n    (no docker)\n'
+		findings=1
+	fi
+	if command -v devcontainer >/dev/null 2>&1; then
+		printf 'ok: devcontainer CLI\n'
+	else
+		printf 'missing: devcontainer CLI\n    npm install -g @devcontainers/cli\n'
+		findings=1
+	fi
+	if [ "$findings" -eq 0 ]; then
+		compose_version_ok
+		case $? in
+		0) printf 'ok: docker compose (%s)\n' "$compose_version" ;;
+		1)
+			printf 'missing: docker compose\n    %s\n' "$COMPOSE_PROBLEM"
+			findings=1
+			;;
+		2) printf 'ok: docker compose (%s, version not understood)\n' "$compose_version" ;;
+		esac
+	fi
+	[ "$findings" -eq 0 ] || exit 1
+	cid=$(running_id) || exit $?
+	if [ -z "$cid" ]; then
+		printf 'missing: container\n    not running — start it with `devc up`, then run `devc doctor` again\n'
+		exit 1
+	fi
+	printf 'ok: container running\n'
+	exec devcontainer exec --workspace-folder "$root" "$BOOTSTRAP" --doctor
+}
+
+case "$verb" in
+daily) cmd_daily ;;
+up) cmd_up ;;
+attach) cmd_attach ;;
+stop) cmd_stop ;;
+rebuild) cmd_rebuild ;;
+firewall)
+	case "$sub" in
+	status) cmd_firewall_status ;;
+	on) cmd_firewall_on ;;
+	off) cmd_firewall_off ;;
+	allow) cmd_firewall_allow ;;
+	esac
+	;;
+exec) cmd_exec "$@" ;;
+doctor) cmd_doctor ;;
+esac
