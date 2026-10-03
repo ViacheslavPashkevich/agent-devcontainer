@@ -1,27 +1,38 @@
 #!/bin/sh
 #
 # Aligns the workspace's named-volume mount points with the dev user, once per
-# container create. See docs/development/setup.md.
+# container create. See README.md.
 #
 # Why it exists: the devcontainer CLI remaps the dev user to the host user's UID
 # on Linux hosts that are not UID 1000, and that remap rewrites /etc/passwd and
 # chowns the home directory — and nothing else. A named volume takes its
 # ownership from the image, where the mount point is necessarily 1000:1000, so a
-# fresh node_modules volume on a remapped container belongs to a user that no
-# longer exists and pnpm cannot write it.
+# fresh volume mounted inside the workspace on a remapped container belongs to a
+# user that no longer exists, and nothing running as dev can write it.
 #
 # Ownership is *read* unprivileged and root is borrowed only to repair, so on
 # macOS and on UID-1000 Linux hosts — where the remap never happens — this is a
 # silent no-op that never touches sudo.
 #
-# POSIX sh like bin/dev-agent and bin/dev-firewall, so the same suite can re-run
-# it under dash.
+# Lives in the image at /usr/local/sbin/dev-own-volumes, root-owned: the sudoers
+# grant names that path and nothing else, so the file an agent can edit is never
+# the file that runs as root.
+#
+# POSIX sh like dev-firewall and devc, so the same suite can re-run it under
+# dash.
 
 set -u
 
+# The program that runs is always the image copy, and this is the path the
+# sudoers grant names — so it is a constant, never discovered.
+SELF=/usr/local/sbin/dev-own-volumes
+
+# The project is bind-mounted here, in every container built from this template.
+WORKSPACE=/workspace
+
 usage() {
 	printf '%s\n' \
-		'Usage: bin/dev-own-volumes' \
+		'Usage: dev-own-volumes' \
 		'' \
 		'  Reconciles the ownership of the workspace named-volume mount' \
 		'  points with the dev user, escalating through' \
@@ -30,14 +41,19 @@ usage() {
 }
 
 die() {
-	printf 'bin/dev-own-volumes: %s\n' "$1" >&2
+	printf 'dev-own-volumes: %s\n' "$1" >&2
 	exit 1
 }
 
-# The mount points, relative to the workspace root — the single source, like
-# ALLOWLIST in bin/dev-firewall. A new named volume inside the workspace is a
-# line here rather than a second sudoers grant.
-VOLUMES='node_modules'
+# --- project section --------------------------------------------------------
+#
+# The mount points, relative to /workspace, whitespace-separated. The template
+# ships none: a project that mounts a named volume inside the workspace (a
+# node_modules that must not share the host's platform binaries, a vendored
+# bundle) lists it here and in compose.yaml. Changing this list needs a rebuild
+# either way, which is why it is not a file of its own.
+VOLUMES=''
+# --- end of project section -------------------------------------------------
 
 # The account the remap moves, and therefore the one the mount points must
 # follow. Named rather than numeric on purpose: 1000 is exactly the assumption
@@ -45,8 +61,8 @@ VOLUMES='node_modules'
 OWNER=dev
 
 # No subcommands: there is one thing to do and it is the whole script. A stray
-# argument is a typo — most likely a subcommand borrowed from bin/dev-firewall —
-# so it is refused rather than ignored.
+# argument is a typo — most likely a subcommand borrowed from dev-firewall — so
+# it is refused rather than ignored.
 if [ "$#" -gt 0 ]; then
 	case "$1" in
 	-h | --help)
@@ -54,7 +70,7 @@ if [ "$#" -gt 0 ]; then
 		exit 0
 		;;
 	*)
-		printf 'bin/dev-own-volumes: unknown argument: %s\n' "$1" >&2
+		printf 'dev-own-volumes: unknown argument: %s\n' "$1" >&2
 		usage >&2
 		exit 2
 		;;
@@ -65,22 +81,6 @@ fi
 # anywhere but inside the container. DEV_OWN_VOLUMES_SENTINEL is the test seam.
 [ -e "${DEV_OWN_VOLUMES_SENTINEL:-/.dockerenv}" ] ||
 	die 'not inside a container — this chowns directories as root and must never run on the host'
-
-# The workspace root is the primary checkout, resolved from this script's own
-# location exactly as bin/dev-firewall does it: a copy running out of
-# .worktrees/<branch>/bin must reconcile — and escalate — the *primary* copy,
-# which is the only path /etc/sudoers.d/dev-own-volumes names.
-script_dir=$(cd "$(dirname "$0")" && pwd -P) ||
-	die 'cannot resolve my own location'
-git_common=$(git -C "$script_dir" rev-parse --git-common-dir 2>/dev/null) &&
-	git_common=$(cd "$script_dir" && cd "$git_common" 2>/dev/null && pwd -P)
-if [ -n "${git_common:-}" ]; then
-	root=${git_common%/*}
-else
-	# Not a git checkout at all (a tarball copy); the script still sits in bin/.
-	root=$(cd "$script_dir/.." && pwd -P) ||
-		die 'cannot resolve the workspace root'
-fi
 
 # The passwd entry, which is what the CLI's remap rewrites — so this reads the
 # *effective* dev user rather than the 1000 the image was built with. Unknowable
@@ -95,7 +95,7 @@ target_gid=$(id -g "$OWNER") && [ -n "$target_gid" ] ||
 # a pre-grant image working on the hosts that were never broken.
 needed=''
 for volume in $VOLUMES; do
-	dir=$root/$volume
+	dir=$WORKSPACE/$volume
 	# The parent is the writable bind mount, so seeding a missing mount point
 	# needs no root — and the fresh directory already belongs to the caller.
 	[ -d "$dir" ] || mkdir -p "$dir" || die "cannot create $dir"
@@ -111,13 +111,13 @@ done
 # separately from the run so a missing sudoers file and a chown that merely
 # failed are different diagnoses.
 if [ "$(id -u)" != 0 ]; then
-	sudo -n -l "$root/bin/dev-own-volumes" >/dev/null 2>&1 ||
-		die 'could not escalate — the image needs /etc/sudoers.d/dev-own-volumes; rebuild it with bin/dev-agent --rebuild'
-	exec sudo -n "$root/bin/dev-own-volumes"
+	sudo -n -l "$SELF" >/dev/null 2>&1 ||
+		die 'could not escalate — the image needs /etc/sudoers.d/dev-own-volumes; rebuild it with `devc rebuild`'
+	exec sudo -n "$SELF"
 fi
 
 for volume in $needed; do
-	dir=$root/$volume
+	dir=$WORKSPACE/$volume
 	# Descendants first, the mount point itself last, so the gate above doubles
 	# as the completion marker: a run killed mid-chown leaves the top level
 	# unchanged and the next create repairs the rest instead of skipping it.

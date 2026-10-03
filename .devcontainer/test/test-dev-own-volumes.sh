@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# test-dev-own-volumes.sh — bin/dev-own-volumes' stub matrix: the converged
-# no-op that must stay quiet and privilege-free, the repair ordered so its own
-# gate doubles as a completion marker, the escalation, every way a probe or a
-# repair can fail, and the host guard.
+# test-dev-own-volumes.sh — dev-own-volumes' stub matrix: the converged no-op
+# that must stay quiet and privilege-free, the repair ordered so its own gate
+# doubles as a completion marker, the escalation, every way a probe or a repair
+# can fail, the empty list the template ships, and the host guard.
 #
 # Run it from anywhere, on the host: bash .devcontainer/test/test-dev-own-volumes.sh
 #
-# `bin/dev-own-volumes` is POSIX sh on purpose, and macOS /bin/sh is bash in
-# POSIX mode — permissive enough to let a bashism through. Re-run the suite
-# against the strictest interpreter the shebang can land on to catch that:
+# `dev-own-volumes` is POSIX sh on purpose, and macOS /bin/sh is bash in POSIX
+# mode — permissive enough to let a bashism through. Re-run the suite against
+# the strictest interpreter the shebang can land on to catch that:
 #
 #   DEV_OWN_VOLUMES_SHELL=dash bash .devcontainer/test/test-dev-own-volumes.sh
 #
@@ -17,18 +17,34 @@
 # generic assertions come from test-helper.sh. Divergences the subject forces,
 # all of them here:
 #
+#   - The template ships an empty VOLUMES list and a fixed /workspace, so the
+#     planted copy is filtered: it gets one fixture volume and a scratch
+#     workspace. One case runs the unfiltered script too, because the empty
+#     list has to be a clean no-op in its own right.
 #   - `stat`, `id`, `chown` and `find` are stubs rather than safe-bin copies:
 #     here they are the subject's *subject matter* — the ownership it reads and
 #     the ownership it writes — and the host's own BSD `stat` does not even
 #     speak `-c`.
-#   - The mount point itself is a real directory in the scratch checkout, so
+#   - The mount point itself is a real directory in the scratch workspace, so
 #     "the missing mount point is created" is observed rather than asserted
 #     against a stub. Its *ownership* is whatever the stat stub says, which is
 #     what lets an unprivileged suite exercise the non-1000 UID it could never
 #     produce for real.
 
 SUBJECT=dev-own-volumes
+SUBJECT_PATH=.devcontainer/sbin/dev-own-volumes
 SUBJECT_SHELL_VAR=DEV_OWN_VOLUMES_SHELL
+
+# The filter the helper applies when planting: the scratch workspace stands in
+# for /workspace, and node_modules is the one fixture volume. Anchored to the
+# whole assignment lines so a reshuffled script fails here, loudly, rather than
+# silently planting an unfiltered copy.
+TMP_WORKSPACE_PLACEHOLDER='__WORKSPACE__'
+plant_filter() {
+	sed -e "s|^WORKSPACE=/workspace\$|WORKSPACE=$TMP_WORKSPACE_PLACEHOLDER|" \
+		-e "s|^VOLUMES=''\$|VOLUMES='node_modules'|"
+}
+
 # shellcheck source=.devcontainer/test/test-helper.sh
 . "$(dirname "${BASH_SOURCE[0]}")/test-helper.sh"
 
@@ -37,9 +53,31 @@ SUBJECT_SHELL_VAR=DEV_OWN_VOLUMES_SHELL
 SENTINEL="$TMP/sentinel"
 : >"$SENTINEL"
 
-# The one entry in the subject's VOLUMES list, under the primary checkout — the
-# path a worktree copy has to answer for too.
-VOLDIR="$REPO/node_modules"
+# The path the sudoers grant names: the image copy, a constant in the subject
+# and so a constant here.
+SELF=/usr/local/sbin/dev-own-volumes
+
+WORKSPACE="$TMP/workspace"
+VOLDIR="$WORKSPACE/node_modules"
+
+# The placeholder is resolved now that $TMP exists; the helper planted before
+# this suite knew the path.
+PLANTED="$REPO/$SUBJECT_PATH"
+sed -i.bak "s|$TMP_WORKSPACE_PLACEHOLDER|$WORKSPACE|" "$PLANTED" && rm -f "$PLANTED.bak"
+grep -q "^WORKSPACE=$WORKSPACE\$" "$PLANTED" || {
+	echo 'the planted copy did not take the scratch workspace — did the WORKSPACE line move?' >&2
+	exit 1
+}
+grep -q "^VOLUMES='node_modules'\$" "$PLANTED" || {
+	echo 'the planted copy did not take the fixture volume — did the VOLUMES line move?' >&2
+	exit 1
+}
+
+# The unfiltered script, for the one case about the list the template ships.
+UNFILTERED="$TMP/unfiltered/dev-own-volumes"
+mkdir -p "$(dirname "$UNFILTERED")"
+cp "$SRC" "$UNFILTERED"
+chmod +x "$UNFILTERED"
 
 # --- stubs ------------------------------------------------------------------
 
@@ -104,9 +142,9 @@ printf 'find %s\n' "$*" >>"$S/calls.log"
 exit 0
 STUB
 
-# The firewall suite's stub: -l is the grant probe, the only thing that can be
-# denied here; the re-exec is recorded but never actually run, so a case can
-# assert the escalation without the whole script running twice.
+# -l is the grant probe, the only thing that can be denied here; the re-exec is
+# recorded but never actually run, so a case can assert the escalation without
+# the whole script running twice.
 cat >"$STUBS/sudo" <<'STUB'
 #!/bin/sh
 set -u
@@ -125,7 +163,7 @@ chmod +x "$STUBS"/*
 ALL_STUBS='id stat chown find sudo'
 
 reset_world() {
-	rm -rf "$STATE" "$VOLDIR"
+	rm -rf "$STATE" "$WORKSPACE"
 	mkdir -p "$STATE" "$VOLDIR"
 	# shellcheck disable=SC2086
 	grant $ALL_STUBS
@@ -138,14 +176,14 @@ reset_world() {
 	RC=0
 }
 
-# runp [--from <checkout>] <args…> — the planted script with a hermetic PATH.
+# runp [--script <path>] <args…> — the planted script with a hermetic PATH.
 runp() {
-	local from="$REPO"
-	if [ "${1:-}" = --from ]; then
-		from="$2"
+	local script="$PLANTED"
+	if [ "${1:-}" = --script ]; then
+		script="$2"
 		shift 2
 	fi
-	capture --cd "$from" env -i \
+	capture --cd "$REPO" env -i \
 		PATH="$CASEBIN:$SAFEBIN" \
 		HOME="$TMP" \
 		STUB_STATE="$STATE" \
@@ -159,10 +197,10 @@ runp() {
 		${CHOWN_STUB_FAIL+CHOWN_STUB_FAIL="$CHOWN_STUB_FAIL"} \
 		${FIND_STUB_FAIL+FIND_STUB_FAIL="$FIND_STUB_FAIL"} \
 		${SUDO_STUB_LIST_RC+SUDO_STUB_LIST_RC="$SUDO_STUB_LIST_RC"} \
-		"$from/bin/dev-own-volumes" "$@"
+		"$script" "$@"
 }
 
-# remapped [<uid>] — the state the whole ticket is about: the passwd entry says
+# remapped [<uid>] — the state the whole script is about: the passwd entry says
 # 1001 while the mount point still carries the image's 1000:1000.
 remapped() {
 	ID_STUB_DEV_UID=1001
@@ -180,20 +218,29 @@ converged() {
 	ID_STUB_UID=${1:-0}
 }
 
-out_empty() {
-	[ -z "$OUT" ] || die "expected no stdout, got:
-$OUT"
-	ok 'stdout is empty'
-}
-
-dir_exists() {
-	[ -d "$1" ] || die "no such directory: $1"
-	ok "directory exists: $1"
-}
-
 PROBE="stat -c %u:%g $VOLDIR"
 DESCENDANTS="find $VOLDIR -mindepth 1 -exec chown -h dev:dev {} +"
 MOUNTPOINT="chown dev:dev $VOLDIR"
+
+# ============================================================================
+# The list the template ships
+# ============================================================================
+
+case_start 'the shipped script lists no volumes, and does nothing but read the account'
+reset_world
+remapped 1001
+runp --script "$UNFILTERED"
+rc_is 0
+out_empty
+# The account is still read — the script has to be able to say when the image
+# lost it — but with nothing to inspect there is no stat, no sudo, no chown.
+log_is 'id -u dev' 'id -g dev'
+cli_not_called sudo
+cli_not_called stat
+ok 'a project that mounts nothing inside the workspace pays for nothing'
+grep -q "^VOLUMES=''\$" "$UNFILTERED" || die 'the shipped script no longer has an empty VOLUMES line'
+grep -q '^WORKSPACE=/workspace$' "$UNFILTERED" || die 'the shipped script no longer fixes WORKSPACE at /workspace'
+ok 'the two project-edited lines are where the README says they are'
 
 # ============================================================================
 # The converged case, which is every macOS and UID-1000 Linux create
@@ -278,23 +325,14 @@ remapped 1001
 runp
 rc_is 0
 log_is 'id -u dev' 'id -g dev' "$PROBE" 'id -u' \
-	"sudo -n -l $REPO/bin/dev-own-volumes" \
-	"sudo -n $REPO/bin/dev-own-volumes"
+	"sudo -n -l $SELF" \
+	"sudo -n $SELF"
 ok 'nothing is attempted unprivileged first'
 cli_not_called chown
 cli_not_called find
 ok 'the unprivileged run writes nothing itself'
-
-case_start 'a worktree copy escalates the primary checkout, which is what sudoers names'
-reset_world
-remapped 1001
-runp --from "$WT"
-rc_is 0
-log_is 'id -u dev' 'id -g dev' "$PROBE" 'id -u' \
-	"sudo -n -l $REPO/bin/dev-own-volumes" \
-	"sudo -n $REPO/bin/dev-own-volumes"
-not_called "$WT"
-ok 'the worktree path never appears — neither sudoers nor the volume is there'
+not_called "$PLANTED"
+ok 'the path escalated is the image copy, not the file that ran'
 
 case_start 'a missing sudoers grant names the fix instead of the symptom'
 reset_world
@@ -303,9 +341,9 @@ SUDO_STUB_LIST_RC=1 runp
 rc_nonzero
 err_has 'could not escalate'
 err_has '/etc/sudoers.d/dev-own-volumes'
-err_has 'bin/dev-agent --rebuild'
+err_has 'devc rebuild'
 log_is 'id -u dev' 'id -g dev' "$PROBE" 'id -u' \
-	"sudo -n -l $REPO/bin/dev-own-volumes"
+	"sudo -n -l $SELF"
 ok 'the grant is probed before the run, so a failed chown is not misreported'
 
 # ============================================================================
@@ -392,15 +430,15 @@ remapped 0
 runp --wat
 rc_is 2
 err_has 'unknown argument: --wat'
-err_has 'Usage: bin/dev-own-volumes'
+err_has 'Usage: dev-own-volumes'
 log_empty
 ok 'a mistyped invocation never chowns anything'
 
 case_start 'a borrowed subcommand is refused rather than ignored'
 reset_world
 remapped 0
-# bin/dev-firewall takes `on`; muscle memory will try it here, and silently
-# doing the one thing this script does would teach the wrong lesson.
+# dev-firewall takes `on`; muscle memory will try it here, and silently doing
+# the one thing this script does would teach the wrong lesson.
 runp on
 rc_is 2
 err_has 'unknown argument: on'
@@ -411,7 +449,7 @@ reset_world
 SENTINEL="$TMP/no-such-sentinel"
 runp --help
 rc_is 0
-out_has 'Usage: bin/dev-own-volumes'
+out_has 'Usage: dev-own-volumes'
 out_has 'Idempotent'
 log_empty
 ok 'help works outside the container too — it is the one thing that must'
