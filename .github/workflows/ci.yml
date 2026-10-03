@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  # The four stub suites: no Docker, no network, every external program a stub.
+  # Under bash, and again under dash for the three sh subjects — the strictest
+  # interpreter their shebang can land on.
+  stub-suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dash and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends dash shellcheck
+      - name: shellcheck the sh programs
+        run: |
+          shellcheck -S warning -s sh .devcontainer/host/devc .devcontainer/sbin/dev-firewall .devcontainer/sbin/dev-own-volumes
+          shellcheck -S warning -s bash -x .devcontainer/test/*.sh
+      - name: Stub suites
+        run: |
+          for suite in devc dev-firewall dev-own-volumes dev-bootstrap; do
+            echo "::group::test-$suite"
+            bash ".devcontainer/test/test-$suite.sh"
+            echo "::endgroup::"
+          done
+      - name: Stub suites under dash
+        run: |
+          DEVC_SHELL=dash bash .devcontainer/test/test-devc.sh
+          DEV_FIREWALL_SHELL=dash bash .devcontainer/test/test-dev-firewall.sh
+          DEV_OWN_VOLUMES_SHELL=dash bash .devcontainer/test/test-dev-own-volumes.sh
+
+  # The real thing: the image built, the container created through the
+  # devcontainer CLI exactly as devc does it, the bootstrap installing the
+  # operator tools through the armed fence, and the smoke checks against the
+  # real internet. Both architectures the image supports.
+  smoke:
+    needs: stub-suites
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install the devcontainer CLI
+        run: npm install -g @devcontainers/cli
+      - name: Host doctor refuses a stopped container
+        run: |
+          set +e
+          .devcontainer/host/devc doctor
+          [ $? -eq 1 ]
+      - name: devc up (build, create, bootstrap behind the fence)
+        run: .devcontainer/host/devc up
+      - name: The bootstrap finished and the tools are present
+        run: |
+          set +e
+          out=$(.devcontainer/host/devc doctor)
+          rc=$?
+          echo "$out"
+          # Exit 1 is expected: nothing is logged in on a CI runner. What must
+          # hold is that the tools are there and nothing failed to provision.
+          [ $rc -le 1 ] || exit 1
+          echo "$out" | grep -q '^ok: claude (' || exit 1
+          echo "$out" | grep -q '^ok: codex (' || exit 1
+          echo "$out" | grep -q '^ok: herdr (' || exit 1
+      - name: Fence smoke (inside, as dev)
+        run: .devcontainer/host/devc exec bash .devcontainer/test/smoke-dev-firewall.sh
+      - name: devc smoke (host verbs against the running container)
+        run: bash .devcontainer/test/smoke-devc.sh
+      - name: Volume repair smoke (a remapped UID)
+        run: bash .devcontainer/test/smoke-dev-own-volumes.sh
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          cid=$(docker ps -aq --filter "label=devcontainer.local_folder=$PWD" | head -n 1)
+          [ -n "$cid" ] && docker logs "$cid" || true
+          [ -n "$cid" ] && docker exec -u root "$cid" sh -c 'tail -n 50 /var/log/dev-firewall*.log 2>/dev/null' || true
