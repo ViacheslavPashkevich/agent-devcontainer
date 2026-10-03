@@ -2,23 +2,32 @@
 #
 # smoke-dev-firewall.sh — the egress fence exercised for real, inside the
 # container, against the real internet. Where test-dev-firewall.sh proves the
-# script issues the right commands, this proves the fence actually fences.
+# script issues the right commands, this proves the fence actually fences —
+# and that the agent identity cannot lift it.
 #
 # Run it as the dev user, from the host:
 #
-#   devcontainer exec --workspace-folder . bash .devcontainer/test/smoke-dev-firewall.sh
+#   devc exec bash .devcontainer/test/smoke-dev-firewall.sh
 #
 # Not `docker exec`, which defaults to root and would test a privilege the
 # agents never have. It needs a *freshly started* container: the opening
 # assertion is that the fence is already armed, which is what proves the compose
-# command arms it at start. After hand-toggling, `bin/dev-firewall on` restores
-# that state. The check leaves the fence armed however it ends.
+# command arms it at start. The check leaves the fence armed however it ends.
+# Lifting enforcement is the host's (`devc firewall off`), so that half is
+# smoke-devc.sh's.
+
+# The checks read as "assert, then report": a test or a command, then `check $?`
+# with the sentence it proves. shellcheck would rather see the status checked
+# directly (SC2181) and not read off a bracket test (SC2319); the idiom is the
+# whole readability of this file, so both are quiet here.
+# shellcheck disable=SC2181,SC2319
 
 set -u
 export LC_ALL=C
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-FIREWALL=$ROOT/bin/dev-firewall
+FIREWALL=/usr/local/sbin/dev-firewall
+OWN_VOLUMES=/usr/local/sbin/dev-own-volumes
+ALLOWLIST=/etc/dev-firewall/allowlist
 DENY_LOG=/var/log/dev-firewall.log
 DNS_LOG=/var/log/dev-firewall-dns.log
 ULOGD_LOG=/var/log/dev-firewall-ulogd.log
@@ -29,11 +38,11 @@ ALL_LOGS="$DENY_LOG $DNS_LOG $ULOGD_LOG"
 # fence has to close at the packet layer.
 EMBEDDED_RESOLVER=127.0.0.11
 
-# An allowlisted host and a deliberately absent one. example.com is the blocked
-# case everywhere below, and its address is needed to find its own denial in the
-# log.
-ALLOWED=https://rubygems.org
-ALLOWED_SECOND=https://registry.npmjs.org
+# Two allowlisted hosts — the ones the bootstrap itself needs — and a
+# deliberately absent one. example.com is the blocked case everywhere below, and
+# its address is needed to find its own denial in the log.
+ALLOWED=https://registry.npmjs.org
+ALLOWED_SECOND=https://api.github.com
 BLOCKED_HOST=example.com
 
 [ -x "$FIREWALL" ] || {
@@ -41,7 +50,11 @@ BLOCKED_HOST=example.com
 	exit 1
 }
 [ -e /.dockerenv ] || {
-	echo 'not inside the container — run this through devcontainer exec' >&2
+	echo 'not inside the container — run this through devc exec' >&2
+	exit 1
+}
+[ "$(id -u)" != 0 ] || {
+	echo 'running as root — run this as the dev user, through devc exec' >&2
 	exit 1
 }
 
@@ -93,16 +106,7 @@ status_says() {
 # REJECT surfaces on a connected UDP socket as EPERM or ECONNREFUSED rather than
 # as a DNS answer — and the timeout bounds a hypothetical DROP.
 resolves_via() {
-	ruby -rresolv -e '
-		begin
-			Resolv::DNS.open(nameserver: [ARGV[0]]) do |dns|
-				dns.timeouts = 2
-				print dns.getaddresses(ARGV[1]).join(" ")
-			end
-		rescue StandardError
-			print ""
-		end
-	' "$1" "$2" 2>/dev/null
+	dig "@$1" +short +time=2 +tries=1 "$2" A 2>/dev/null | grep -E '^[0-9.]+$'
 }
 
 # log_size <file> — bytes, 0 for a file that is not there.
@@ -123,8 +127,40 @@ check $? 'the log rotator is running'
 # rotation loop itself, not a stale pidfile pointing at some reused pid.
 rotator_pid=$("$FIREWALL" status | sed -n 's/^rotator: up (pid \([0-9]*\)).*/\1/p')
 [ -n "$rotator_pid" ] &&
-	tr '\0' ' ' <"/proc/$rotator_pid/cmdline" 2>/dev/null | grep -q 'dev-firewall.*rotate'
-check $? "the pid status reports (${rotator_pid:-none}) is running dev-firewall rotate"
+	tr '\0' ' ' <"/proc/$rotator_pid/cmdline" 2>/dev/null | grep -q "$FIREWALL.*rotate"
+check $? "the pid status reports (${rotator_pid:-none}) is running $FIREWALL rotate"
+
+case_start 'the privileged programs are the image copies, root-owned and read-only to dev'
+for program in "$FIREWALL" "$OWN_VOLUMES" "$ALLOWLIST"; do
+	[ "$(stat -c '%U' "$program")" = root ]
+	check $? "$program is owned by root"
+	[ ! -w "$program" ]
+	check $? "$program is not writable by dev" 'the whole privilege argument rests on this'
+done
+[ -r "$ALLOWLIST" ]
+check $? 'the allowlist is readable by dev — what is allowed is no secret'
+status_says '^allowlist: .*github\.com'
+check $? 'status prints the allowlist from the image file'
+
+case_start 'the agent identity can arm and read, but not lift'
+"$FIREWALL" status >/dev/null
+check $? 'dev-firewall status works through the grant'
+output=$("$FIREWALL" off 2>&1)
+[ $? != 0 ] && printf '%s\n' "$output" | grep -qF 'devc firewall off'
+check $? 'dev-firewall off is refused to dev, pointing at the host verb' "$output"
+status_says '^enforcement: armed$'
+check $? 'enforcement stands after the refused off'
+sudo -n "$FIREWALL" off >/dev/null 2>&1
+[ $? != 0 ]
+check $? 'sudo refuses dev-firewall off outright — the grant lists its subcommands' 'an unscoped grant fails here'
+sudo -n "$FIREWALL" status >/dev/null 2>&1
+check $? 'sudo allows dev-firewall status — the same grant, the listed argument'
+sudo -n true 2>/dev/null
+[ $? != 0 ]
+check $? 'casual sudo stays unavailable to dev'
+sudo -n "$OWN_VOLUMES" --help >/dev/null 2>&1
+[ $? != 0 ]
+check $? 'sudo refuses dev-own-volumes with an argument — the grant allows none'
 
 case_start 'dnsmasq is the resolver the container actually uses'
 # Not "resolv.conf looks right": dev-firewall.probe is answered by our own
@@ -146,16 +182,10 @@ check $? "a direct query to $EMBEDDED_RESOLVER for $BLOCKED_HOST resolves nothin
 # there too, because it is the unlogged resolver that is off limits.
 [ -z "$(resolves_via "$EMBEDDED_RESOLVER" "${ALLOWED#https://}")" ]
 check $? "the same path is closed for the allowlisted ${ALLOWED#https://}"
-# The positive control. Without it, a probe that rescues every error would pass
-# just as well on a broken ruby.
+# The positive control. Without it, a probe that swallows every error would pass
+# just as well on a broken dig.
 [ -n "$(resolves_via 127.0.0.1 "$BLOCKED_HOST")" ]
 check $? 'the same probe against the local dnsmasq does resolve' 'without this the two checks above prove nothing'
-
-case_start 'the fence does not fence the database'
-getent hosts postgres >/dev/null
-check $? 'the compose service name still resolves'
-pg_isready -h postgres -U postgres >/dev/null
-check $? 'postgres is reachable with the fence armed'
 
 case_start 'the allowlist is fed by the resolver at runtime, not seeded at init'
 # `on` flushes the ipset and restarts dnsmasq with an empty cache, so the fetch
@@ -165,29 +195,19 @@ check $? 're-arming flushes the allowlist ipset'
 reachable "$ALLOWED"
 check $? "$ALLOWED is reachable after the flush" 'nothing seeded the set — the resolver fed it'
 # A second domain, not resolved since that flush: per-query feeding rather than
-# a one-shot fill at arm time. (A literal rotation — one name answering with a
-# new address — needs authoritative DNS this check does not have; dnsmasq adds
-# every answer it returns, so these are the same code path.)
+# a one-shot fill at arm time.
 reachable "$ALLOWED_SECOND"
 check $? "$ALLOWED_SECOND is reachable without re-arming"
 
-case_start 'the gem audit can still reach its advisory database'
-# The trap worth its own case: bundler-audit does not fail when it cannot
-# refresh, it audits a stale database and reports green. A blocked github.com
-# turns the QA gate's security step into a lie.
-git ls-remote https://github.com/rubysec/ruby-advisory-db.git HEAD >/dev/null 2>&1
-check $? 'github.com is reachable, so the advisory DB can refresh'
-
-case_start 'SSH host-key scans reach both Git providers through the armed fence'
+case_start 'git reaches GitHub through the armed fence, over both transports'
+git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null 2>&1
+check $? 'an https clone target answers'
 # Credential-free on purpose: ssh-keyscan reads the host key before any
-# authentication, so these hold with no key registered at either provider.
-# What they guard: narrowing the accept rule to a port, or trimming the
-# dev.azure.com suffix, would break all SSH Git with no other signal. stderr is
-# keyscan's own comment chatter; only the keys on stdout count as an answer.
+# authentication, so this holds with no key registered. What it guards:
+# narrowing the accept rule to a port would break all SSH Git with no other
+# signal. stderr is keyscan's own comment chatter; only the keys count.
 [ -n "$(ssh-keyscan -T 10 github.com 2>/dev/null)" ]
-check $? 'github.com answers a host-key scan'
-[ -n "$(ssh-keyscan -T 10 ssh.dev.azure.com 2>/dev/null)" ]
-check $? 'ssh.dev.azure.com answers a host-key scan' 'the dev.azure.com suffix must cover this host'
+check $? 'github.com answers a host-key scan — the allowlist is about destinations, not 443'
 
 case_start 'a non-allowlisted domain is blocked, and blocked fast'
 # Every address the name has, not just the first: curl picks its own, and which
@@ -198,7 +218,7 @@ blocked_pattern="DST=($(printf '%s\n' "$blocked_ips" | paste -sd '|' -)) "
 check $? "$BLOCKED_HOST still resolves (the deny is at the IP layer)"
 baseline=$(wc -l <"$DENY_LOG" 2>/dev/null || echo 0)
 started=$(date +%s)
-curl -fsS -o /dev/null --max-time 20 "https://$BLOCKED_HOST"
+curl -fsS -o /dev/null --max-time 20 "https://$BLOCKED_HOST" 2>/dev/null
 curl_rc=$?
 elapsed=$(($(date +%s) - started))
 [ "$curl_rc" != 0 ]
@@ -228,7 +248,7 @@ case_start "the fence's exhaust is bounded"
 # testable without writing 4 MiB of denials. The timer runs the same code with
 # the threshold applied.
 "$FIREWALL" rotate --force >/dev/null
-check $? 'rotate --force exits clean'
+check $? 'rotate --force exits clean, through the grant'
 for log in $ALL_LOGS; do
 	live=$(log_size "$log")
 	kept=$(log_size "$log.1")
@@ -270,25 +290,6 @@ status_says '^enforcement: armed$'
 check $? 'rotating changed nothing about enforcement'
 status_says '^rotator: up'
 check $? 'the rotator is still up after rotating by hand'
-
-case_start 'off lifts enforcement and on re-arms it'
-"$FIREWALL" off >/dev/null
-check $? 'off exits clean'
-status_says '^enforcement: off$'
-check $? 'status reports off'
-reachable "https://$BLOCKED_HOST"
-check $? "$BLOCKED_HOST is reachable with enforcement off"
-# The resolver survives `off` — that is the whole point of toggling only the
-# jump, so a debugging session keeps its names and its denial annotations.
-status_says '^resolver: up'
-check $? 'the resolver stayed up across the toggle'
-"$FIREWALL" on >/dev/null
-check $? 'on exits clean'
-status_says '^enforcement: armed$'
-check $? 'status reports armed again'
-curl -fsS -o /dev/null --max-time 20 "https://$BLOCKED_HOST"
-[ "$?" != 0 ]
-check $? "$BLOCKED_HOST is refused again"
 
 # ============================================================================
 
