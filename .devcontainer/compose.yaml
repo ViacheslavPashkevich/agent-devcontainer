@@ -34,6 +34,16 @@ services:
       # The dev home: logins, the operator tools, shell history. Survives
       # restarts, recreates and rebuilds.
       - home:/home/dev
+      # --- project section: mounts -------------------------------------------
+      #
+      # Named volumes inside the workspace go in this list — a second
+      # `volumes:` key lower down would be a duplicate YAML rejects. Each one
+      # also needs its mount point in the Dockerfile and a line in
+      # dev-own-volumes' VOLUMES. Shape:
+      #
+      # - node-modules:/workspace/node_modules
+      #
+      # --- end of project section --------------------------------------------
     # Gitignored, optional: a fresh clone boots without it (the doctor reports
     # the missing variables). `required` needs Docker Compose >= 2.24.
     env_file:
@@ -42,15 +52,12 @@ services:
     # --- project section: the app service ----------------------------------
     #
     # Ports (loopback only, so nothing on the LAN reaches the dev servers),
-    # environment, named volumes inside the workspace, dependencies on the
-    # services below. Shape:
+    # environment, dependencies on the services below. Shape:
     #
     # ports:
     #   - "127.0.0.1:3000:3000"
     # environment:
     #   DATABASE_URL: postgres://postgres:postgres@postgres:5432
-    # volumes:
-    #   - node-modules:/workspace/node_modules
     # depends_on:
     #   postgres:
     #     condition: service_healthy

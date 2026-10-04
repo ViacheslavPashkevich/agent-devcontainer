@@ -81,7 +81,8 @@ procedure below expects to find as the template left it.
 | `Dockerfile` | base image | `ARG BASE_IMAGE=…` — any Debian-family image, typically a language image. |
 | `Dockerfile` | packages | OS packages: build dependencies, browser libraries, database clients, a vendor's apt repository. |
 | `Dockerfile` | mount points and environment | A `mkdir`+`chown` per named volume mounted inside the workspace; project-wide `ENV`. |
-| `compose.yaml` | the app service | Ports (loopback only), environment, named volumes inside the workspace, `depends_on`. |
+| `compose.yaml` | mounts | Named volumes inside the workspace, inside the engine's `volumes:` list. |
+| `compose.yaml` | the app service | Ports (loopback only), environment, `depends_on`. |
 | `compose.yaml` | services | Databases, caches. Service names resolve from inside the container. |
 | `compose.yaml` | volumes | The named volumes the two sections above refer to. |
 | `firewall/allowlist` | whole file | The domains the project needs to reach. Roughly half of a real project's list is project-specific. |
