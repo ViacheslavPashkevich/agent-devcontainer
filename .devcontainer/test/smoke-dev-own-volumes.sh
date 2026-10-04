@@ -17,9 +17,9 @@
 # other mount point as the image left it. `groupmod`/`usermod` below reach the
 # same end state and fail loudly on an ID collision rather than half-applying.
 #
-# The template ships an empty VOLUMES list, so the first step installs, as root
-# and at the image path, a copy of the shipped script with one fixture volume —
-# exactly what a project's edit produces. The grant names that path, so the
+# The first step installs, as root and at the image path, a copy of the image's
+# script with one fixture volume in place of whatever list it ships — empty in
+# the template, filled in a project's copy. The grant names that path, so the
 # escalation under test is the real one.
 #
 # The image comes from the running devcontainer, so this checks what the
@@ -144,10 +144,13 @@ printf 'image: %s\nvolume: %s\n\n' "$IMAGE" "$VOLUME"
 
 # ============================================================================
 
-case_start 'the shipped program lists no volumes; the fixture gives it one'
-root_run grep -q "^VOLUMES=''\$" "$PROGRAM"
-check $? 'the image copy ships VOLUMES empty' 'the template mounts nothing inside the workspace'
-root_run sh -c "sed \"s/^VOLUMES=''\\\$/VOLUMES='node_modules'/\" $PROGRAM > /tmp/own && install -m 0755 -o root -g root /tmp/own $PROGRAM && rm /tmp/own"
+case_start 'the image program gets the one fixture volume, whatever list it ships'
+# The template ships the list empty and a project fills it; this check is the
+# same for both, so the fixture replaces whatever is there.
+shipped=$(root_run sed -n "s/^VOLUMES='\(.*\)'\$/\1/p" "$PROGRAM")
+root_run grep -qE "^VOLUMES='[^']*'\$" "$PROGRAM"
+check $? "the image copy has a VOLUMES line to edit (ships: '${shipped}')"
+root_run sh -c "sed \"s/^VOLUMES='[^']*'\\\$/VOLUMES='node_modules'/\" $PROGRAM > /tmp/own && install -m 0755 -o root -g root /tmp/own $PROGRAM && rm /tmp/own"
 check $? "a copy with one fixture volume is installed at $PROGRAM, root-owned — a project's edit, exactly"
 root_run grep -q "^VOLUMES='node_modules'\$" "$PROGRAM"
 check $? 'the installed copy carries the fixture list'

@@ -19,8 +19,9 @@
 #
 #   - The template ships an empty VOLUMES list and a fixed /workspace, so the
 #     planted copy is filtered: it gets one fixture volume and a scratch
-#     workspace. One case runs the unfiltered script too, because the empty
-#     list has to be a clean no-op in its own right.
+#     workspace, whatever list the copy under test carries — a project's copy
+#     has filled it. One case runs the unfiltered script too, and asserts the
+#     empty list is a clean no-op where the list is in fact empty.
 #   - `stat`, `id`, `chown` and `find` are stubs rather than safe-bin copies:
 #     here they are the subject's *subject matter* — the ownership it reads and
 #     the ownership it writes — and the host's own BSD `stat` does not even
@@ -42,7 +43,7 @@ SUBJECT_SHELL_VAR=DEV_OWN_VOLUMES_SHELL
 TMP_WORKSPACE_PLACEHOLDER='__WORKSPACE__'
 plant_filter() {
 	sed -e "s|^WORKSPACE=/workspace\$|WORKSPACE=$TMP_WORKSPACE_PLACEHOLDER|" \
-		-e "s|^VOLUMES=''\$|VOLUMES='node_modules'|"
+		-e "s|^VOLUMES='[^']*'\$|VOLUMES='node_modules'|"
 }
 
 # shellcheck source=.devcontainer/test/test-helper.sh
@@ -226,21 +227,29 @@ MOUNTPOINT="chown dev:dev $VOLDIR"
 # The list the template ships
 # ============================================================================
 
-case_start 'the shipped script lists no volumes, and does nothing but read the account'
+case_start 'the shipped script fixes the workspace, and an empty list is a clean no-op'
 reset_world
 remapped 1001
-runp --script "$UNFILTERED"
-rc_is 0
-out_empty
-# The account is still read — the script has to be able to say when the image
-# lost it — but with nothing to inspect there is no stat, no sudo, no chown.
-log_is 'id -u dev' 'id -g dev'
-cli_not_called sudo
-cli_not_called stat
-ok 'a project that mounts nothing inside the workspace pays for nothing'
-grep -q "^VOLUMES=''\$" "$UNFILTERED" || die 'the shipped script no longer has an empty VOLUMES line'
 grep -q '^WORKSPACE=/workspace$' "$UNFILTERED" || die 'the shipped script no longer fixes WORKSPACE at /workspace'
+grep -qE "^VOLUMES='[^']*'\$" "$UNFILTERED" || die 'the shipped script has no single-quoted VOLUMES line to edit'
 ok 'the two project-edited lines are where the README says they are'
+# The template ships the list empty; a project's copy fills it. Both are the
+# same script, so the no-op claim is asserted only where it applies.
+if grep -q "^VOLUMES=''\$" "$UNFILTERED"; then
+	runp --script "$UNFILTERED"
+	rc_is 0
+	out_empty
+	# The account is still read — the script has to be able to say when the
+	# image lost it — but with nothing to inspect there is no stat, no sudo,
+	# no chown.
+	log_is 'id -u dev' 'id -g dev'
+	cli_not_called sudo
+	cli_not_called stat
+	ok 'a project that mounts nothing inside the workspace pays for nothing'
+else
+	printf '  -- the list is filled (%s): the no-op claim does not apply to this copy\n' \
+		"$(sed -n "s/^VOLUMES='\(.*\)'\$/\1/p" "$UNFILTERED")"
+fi
 
 # ============================================================================
 # The converged case, which is every macOS and UID-1000 Linux create
