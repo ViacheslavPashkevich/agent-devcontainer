@@ -103,9 +103,23 @@ grep -qF -- "\"postCreateCommand\": \"$POST_CREATE\"" "$CONFIG" ||
 
 # --- the fixture ------------------------------------------------------------
 
+# The volume is mounted *inside* the bind-mounted checkout, so its mount point
+# is a directory in the checkout on the host. Left to Docker, that directory
+# appears root-owned and stays behind after the run; so it is made here, as the
+# host user, and removed at the end if this run made it. Its ownership inside
+# the container is the volume's, not the host directory's, so the fixture is
+# unchanged by this.
+MOUNTPOINT="$ROOT/node_modules"
+MOUNTPOINT_MADE=''
+if [ ! -e "$MOUNTPOINT" ]; then
+	mkdir "$MOUNTPOINT" || die "cannot create the mount point $MOUNTPOINT"
+	MOUNTPOINT_MADE=1
+fi
+
 cleanup() {
 	docker rm -f "$CONTAINER" >/dev/null 2>&1
 	docker volume rm "$VOLUME" >/dev/null 2>&1
+	[ -z "$MOUNTPOINT_MADE" ] || rmdir "$MOUNTPOINT" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
