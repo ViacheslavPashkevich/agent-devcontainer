@@ -11,7 +11,7 @@ jobs:
   # Under bash, and again under dash for the three sh subjects — the strictest
   # interpreter their shebang can land on.
   stub-suites:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Install dash and shellcheck
@@ -46,7 +46,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
       - name: Install the devcontainer CLI
