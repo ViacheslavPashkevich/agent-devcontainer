@@ -24,9 +24,9 @@ Engine, present in every copy:
 - A non-root `dev` user; its home on a named volume, so logins, tools and
   history survive restarts, recreates and rebuilds; the project bind-mounted at
   the fixed `/workspace`.
-- zsh with a prompt and shared history, nvim defaults, yazi — configured under
-  `/etc`, so the home volume cannot shadow it and your own dotfiles run after
-  and win.
+- zsh with a prompt, shared history and fzf key bindings, nvim defaults, yazi
+  — configured under `/etc`, so the home volume cannot shadow it and your own
+  dotfiles run after and win.
 - python3 with pip and venv (and `python` → `python3`), node LTS, git, gh,
   openssh-client, curl, jq, ripgrep, fd, tree, unzip, file. `LANG=C.UTF-8`.
 - claude, codex and herdr, installed into the home volume by the bootstrap and
@@ -213,9 +213,12 @@ allowlist says "but only reach these places".
 ## Shell, editor and clipboard
 
 The shell is zsh, configured in `/etc/zsh/devcontainer.zshrc`: shared history,
-autosuggestions, syntax highlighting, a `user@host:cwd[branch]` prompt, and `y`
-to run yazi and land in the directory it exited in. Your `~/.zshrc` runs after
-it and wins.
+autosuggestions, syntax highlighting, a `user@host:cwd[branch]` prompt, `g` for
+git, and `y` to run yazi and land in the directory it exited in. fzf provides
+fuzzy history search on Ctrl-R, file paths on Ctrl-T, directories on Alt-C and
+`**<Tab>` completion. Ctrl-K, Ctrl-J and the arrows walk history by the prefix
+already typed, which displaces kill-line and accept-line on the two control
+keys. Your `~/.zshrc` runs after it and wins.
 
 nvim gets a copy-only OSC 52 clipboard from `/etc/xdg/nvim/plugin/`: yanks to
 `+` and `*` reach the attached terminal's clipboard; register paste is

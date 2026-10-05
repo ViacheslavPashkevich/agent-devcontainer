@@ -31,10 +31,12 @@ ENV LANG=C.UTF-8
 # and python-is-python3, because the first `pip install` on a slim image fails
 # without them.
 #
-# The shell and editor: zsh with its two plugins, neovim, ncurses-term for the
-# extended terminfo entries the herdr TUI and nvim need inside its panes, less
-# as the pager gh and git shell out to, procps for ps/pgrep (anything
-# supervising processes reads a missing binary as "nothing running").
+# The shell and editor: zsh with its two plugins, fzf for its zsh key bindings
+# (fuzzy Ctrl-R history, Ctrl-T files, Alt-C directories), neovim, ncurses-term
+# for the extended terminfo entries the herdr TUI and nvim need inside its
+# panes, less as the pager gh and git shell out to, procps for ps/pgrep
+# (anything supervising processes reads a missing binary as "nothing
+# running").
 #
 # ca-certificates and gnupg serve the repository setup below.
 RUN apt-get update -qq && \
@@ -45,6 +47,7 @@ RUN apt-get update -qq && \
       dnsmasq-base \
       fd-find \
       file \
+      fzf \
       git \
       gnupg \
       iproute2 \
@@ -170,9 +173,17 @@ COPY etc/ /etc/
 #
 # Then the checks. BuildKit checks the Dockerfile, not the zsh it installs, so
 # without these a typo ships and breaks every pane. `zsh -n` parses the rc; the
-# interactive run then executes it — compinit and both plugin sources — and
-# proves `y` came out a function. The prompt needs the throwaway repository
-# because its two failure modes are both invisible to a syntax check: vcs_info
+# interactive run then executes it — compinit, fzf's bindings and both plugin
+# sources — and proves `y` came out a function and `g` an alias. The key
+# probes pin what each key actually does once everything has loaded: fzf has
+# to have won Ctrl-R, and the prefix history walk has to hold Ctrl-K, Ctrl-J
+# and both arrows — a Debian rename of the fzf package, or a later source
+# rebinding a key, would otherwise ship silently. Each probe prints "can't
+# change option: zle" twice on stderr: fzf's script restores the options it
+# found through eval, and zle cannot be switched on without a tty. It is
+# noise, not a failure — the bindings land and the probes read stdout. The
+# prompt needs the throwaway repository because its two failure modes are
+# both invisible to a syntax check: vcs_info
 # has to actually resolve a branch, and PROMPT has to still hold the reference
 # *unexpanded* — lose PROMPT_SUBST or the quoting and it silently freezes at
 # the shell's starting branch forever.
@@ -182,6 +193,15 @@ RUN rm -f /usr/share/zsh/*/scripts/newuser && \
     zsh -n /etc/zsh/zshrc && \
     zsh -n /etc/zsh/devcontainer.zshrc && \
     zsh -ic 'whence -w y' | grep -q 'function' && \
+    zsh -ic 'whence -w g' | grep -q 'alias' && \
+    zsh -ic 'bindkey "^R"' | grep -q 'fzf-history-widget' && \
+    zsh -ic 'bindkey "^T"' | grep -q 'fzf-file-widget' && \
+    zsh -ic 'bindkey "^K"' | grep -q 'up-line-or-beginning-search' && \
+    zsh -ic 'bindkey "^J"' | grep -q 'down-line-or-beginning-search' && \
+    zsh -ic 'bindkey "^[[A"' | grep -q 'up-line-or-beginning-search' && \
+    zsh -ic 'bindkey "^[OA"' | grep -q 'up-line-or-beginning-search' && \
+    zsh -ic 'bindkey "^[[B"' | grep -q 'down-line-or-beginning-search' && \
+    zsh -ic 'bindkey "^[OB"' | grep -q 'down-line-or-beginning-search' && \
     zsh -ic 'print -r -- $PROMPT' | grep -qF '${vcs_info_msg_0_}' && \
     zsh -ic 'print -r -- $PATH' | grep -qF '/usr/local/sbin' && \
     tmp="$(mktemp -d)" && \
