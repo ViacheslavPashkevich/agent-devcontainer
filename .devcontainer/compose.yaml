@@ -63,9 +63,17 @@ services:
       #
       # Loopback only, so nothing on the LAN reaches the dev servers. Ports go
       # in this list — a second `ports:` key lower down would be a duplicate
-      # YAML rejects. Shape:
+      # YAML rejects. The host side comes from .env with the usual number as
+      # its default: which numbers are free is a fact about the host, not
+      # about the project, and `devc ports show-all` shows what is taken.
+      # Shape:
       #
-      # - "127.0.0.1:3000:3000"
+      # - "127.0.0.1:${WEB_PORT:-3000}:3000"
+      #
+      # A server the browser reaches by number, such as an asset dev server,
+      # needs the same port on both sides and has to be told to listen on it:
+      #
+      # - "127.0.0.1:${ASSETS_PORT:-3036}:${ASSETS_PORT:-3036}"
       #
       # --- end of project section --------------------------------------------
     # --- project section: the app service ----------------------------------

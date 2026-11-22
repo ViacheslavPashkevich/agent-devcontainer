@@ -1,8 +1,8 @@
 #!/bin/sh
 #
 # devc — the host-side entry point to the agent devcontainer: start it, attach
-# to it, stop it, rebuild it, drive the egress fence, run a command inside, and
-# check the whole setup. Identical locally and over ssh to the host. See
+# to it, stop it, rebuild it, drive the egress fence, run a command inside, list
+# the ports it publishes, and check the whole setup. Identical locally and over ssh to the host. See
 # README.md.
 #
 # One verb per invocation; flags only modify a verb; nothing privileged happens
@@ -47,6 +47,10 @@ usage() {
 		'                             append to .devcontainer/firewall/allowlist, push' \
 		'                             it into the running container, re-arm' \
 		'' \
+		'  devc ports show            the ports this project publishes, a URL for each,' \
+		'                             and the ssh tunnel for the loopback-only ones' \
+		'  devc ports show-all        the same for every devcontainer on this host' \
+		'' \
 		'  devc exec <command...>     run a command inside, as the dev user' \
 		'  devc doctor                host prerequisites, then dev-bootstrap --doctor inside' \
 		'' \
@@ -85,6 +89,17 @@ firewall)
 		;;
 	*) usage_error "unknown firewall subcommand: $sub" ;;
 	esac
+	;;
+ports)
+	sub=${1:-}
+	[ -n "$sub" ] || usage_error 'ports needs a subcommand: show or show-all'
+	shift
+	case "$sub" in
+	show) ports_scope=one ;;
+	show-all) ports_scope=all ;;
+	*) usage_error "unknown ports subcommand: $sub" ;;
+	esac
+	[ "$#" -eq 0 ] || usage_error "ports $sub takes no arguments"
 	;;
 exec) [ "$#" -gt 0 ] || usage_error 'exec needs a command to run' ;;
 -h | --help)
@@ -355,6 +370,269 @@ cmd_firewall_allow() {
 	exec docker exec -u root "$cid" "$FIREWALL" on
 }
 
+# --- ports ------------------------------------------------------------------
+#
+# Docker is the registry: what a container publishes is read from the daemon,
+# never from a list someone has to keep. One `docker ps` and one `docker
+# inspect` cover every container on the host, because a port number is only
+# useful if it means one project here — which is a fact about the whole host,
+# not about this checkout.
+
+# One line per container (C), per T3_PORT it carries (E) and per published port
+# (P), `|`-separated with the free-form value last. A running container answers
+# with what is actually bound; a stopped one with what it is configured to
+# bind, so a project that is down still owns its numbers.
+PORTS_FORMAT='{{$p := index .Config.Labels "com.docker.compose.project"}}{{$s := index .Config.Labels "com.docker.compose.service"}}{{$n := .Name}}{{$r := .State.Running}}C|{{$p}}|{{$s}}|{{$n}}|{{$r}}|{{index .Config.Labels "devcontainer.local_folder"}}{{"\n"}}{{range .Config.Env}}{{if eq (printf "%.8s" .) "T3_PORT="}}E|{{$p}}|{{$s}}|{{$n}}|{{$r}}|{{.}}{{"\n"}}{{end}}{{end}}{{if $r}}{{range $k, $v := .NetworkSettings.Ports}}{{range $v}}P|{{$p}}|{{$s}}|{{$n}}|{{$r}}|{{$k}}|{{.HostIp}}|{{.HostPort}}{{"\n"}}{{end}}{{end}}{{else}}{{range $k, $v := .HostConfig.PortBindings}}{{range $v}}P|{{$p}}|{{$s}}|{{$n}}|{{$r}}|{{$k}}|{{.HostIp}}|{{.HostPort}}{{"\n"}}{{end}}{{end}}{{end}}'
+
+# port_scan — every container's published ports into PORT_SCAN; 1 when docker
+# cannot say. A container that vanishes between the two calls fails the inspect
+# but not the others' lines, so output is trusted over the status.
+port_scan() {
+	scan_ids=$(docker ps -aq) || return 1
+	PORT_SCAN=''
+	[ -n "$scan_ids" ] || return 0
+	# One id per line; splitting them into arguments is the intent.
+	# shellcheck disable=SC2086
+	PORT_SCAN=$(docker inspect -f "$PORTS_FORMAT" $scan_ids 2>/dev/null) ||
+		[ -n "$PORT_SCAN" ] || return 1
+}
+
+# ssh_target — how another machine reaches this host, into SSH_USER, SSH_HOST
+# and SSH_PORT. Over ssh the answer is exact: SSH_CONNECTION carries the
+# address and port the client actually dialled. On the host's own terminal it
+# is the best guess, the host's name.
+ssh_target() {
+	SSH_USER=${USER:-${LOGNAME:-}}
+	[ -n "$SSH_USER" ] || SSH_USER=$(id -un 2>/dev/null) || SSH_USER=''
+	SSH_HOST=''
+	SSH_PORT=22
+	if [ -n "${SSH_CONNECTION:-}" ]; then
+		# "client-address client-port server-address server-port".
+		# shellcheck disable=SC2086
+		set -- $SSH_CONNECTION
+		SSH_HOST=${3:-}
+		SSH_PORT=${4:-22}
+	fi
+	[ -n "$SSH_HOST" ] || SSH_HOST=$(uname -n)
+}
+
+# ports_report <mode> — the scan, rendered. Modes: `table` for the verb,
+# `check` for the doctor (the findings alone, exit 1 when there are any). Exit
+# 3: this checkout has no container. The values travel in the environment, not
+# through -v, which would interpret backslashes in a path.
+ports_report() {
+	printf '%s\n' "$PORT_SCAN" |
+		DEVC_ROOT=$root DEVC_MODE=$1 DEVC_SCOPE=${ports_scope:-one} \
+			DEVC_SSH_USER=${SSH_USER:-} DEVC_SSH_HOST=${SSH_HOST:-} DEVC_SSH_PORT=${SSH_PORT:-22} \
+			awk "$PORTS_AWK"
+}
+
+# shellcheck disable=SC2016
+PORTS_AWK='
+function clean(v) { return (v == "<no value>") ? "" : v }
+
+# The compose project, or the container name for a container outside compose.
+function project_of(p, n) {
+	p = clean(p)
+	if (p != "") return p
+	sub(/^\//, "", n)
+	return n
+}
+
+# What the operator calls it: the project without the suffix the devcontainer
+# CLI gives every compose project it creates.
+function label(p) { sub(/_devcontainer$/, "", p); return p }
+
+function pad(v, w) { return sprintf("%-" w "s", v) }
+
+function wildcard(ip) { return ip == "0.0.0.0" || ip == "::" }
+function loopback(ip) { return ip ~ /^127\./ || ip == "::1" }
+function bracket(ip) { return (ip ~ /:/) ? "[" ip "]" : ip }
+
+# Ports that speak something a browser does not; a URL for them would mislead.
+function plain(cport) {
+	return cport == 5432 || cport == 3306 || cport == 6379 || cport == 27017 || cport == 11211
+}
+
+# The smallest port above <port> that no container seen here publishes.
+function next_free(port) {
+	port += 0
+	do port++; while (port in taken)
+	return port
+}
+
+# The entries of one project, ordered by host port, into sel[1..nsel].
+function select(p,    i, j, t) {
+	nsel = 0
+	for (i = 1; i <= n; i++) if (pproj[i] == p) sel[++nsel] = i
+	for (i = 2; i <= nsel; i++)
+		for (j = i; j > 1 && phost[sel[j]] + 0 < phost[sel[j - 1]] + 0; j--) {
+			t = sel[j]; sel[j] = sel[j - 1]; sel[j - 1] = t
+		}
+}
+
+# Where a port is reached from another machine.
+function url(i,    scheme, host) {
+	if (pproto[i] != "tcp") return pproto[i] " only"
+	scheme = plain(pcport[i]) ? "" : "http://"
+	if (loopback(pip[i])) host = "localhost"
+	else if (wildcard(pip[i])) host = bracket(ENVIRON["DEVC_SSH_HOST"])
+	else host = bracket(pip[i])
+	return scheme host ":" phost[i]
+}
+
+function tunnelled(i) { return pproto[i] == "tcp" && loopback(pip[i]) }
+
+# Every other project publishing one of <p>s port numbers, into note[1..nnote].
+# A stopped container counts only when it is a devcontainer: a project that is
+# down still owns its numbers, an exited one-off container owns nothing.
+function findings(p,    a, b, i, j, key, other, same) {
+	select(p)
+	nnote = 0
+	split("", noted)
+	for (a = 1; a <= nsel; a++) {
+		i = sel[a]
+		for (j = 1; j <= n; j++) {
+			other = pproj[j]
+			if (other == p || phost[j] != phost[i] || pproto[j] != pproto[i]) continue
+			if (!prun[j] && !(other in folder)) continue
+			key = phost[i] SUBSEP other
+			if (key in noted) continue
+			noted[key] = 1
+			same = pip[i] == pip[j] || wildcard(pip[i]) || wildcard(pip[j])
+			if (same)
+				note[++nnote] = "port " phost[i] " is also published by " label(other) \
+					" — the two cannot run at once; next free: " next_free(phost[i])
+			else
+				note[++nnote] = "port " phost[i] " is also published by " label(other) " (on " pip[j] \
+					") — both start, but " phost[i] " no longer names one project; next free: " next_free(phost[i])
+		}
+	}
+}
+
+function print_table(p,    a, i, w1, w2, w3, w4, f, flags, forwards) {
+	printf "%s — %s%s\n", label(p), folder[p], (p in up) ? "" : " (stopped)"
+	select(p)
+	if (nsel == 0) { print "  no published ports"; return }
+	w1 = 7; w2 = 6; w3 = 9; w4 = 3
+	for (a = 1; a <= nsel; a++) {
+		i = sel[a]
+		if (length(psvc[i]) > w1) w1 = length(psvc[i])
+		if (length(pcport[i]) > w2) w2 = length(pcport[i])
+		if (length(pip[i] ":" phost[i]) > w3) w3 = length(pip[i] ":" phost[i])
+		if (length(url(i)) > w4) w4 = length(url(i))
+	}
+	print "  " pad("SERVICE", w1) "  " pad("INSIDE", w2) "  " pad("PUBLISHED", w3) "  URL"
+	forwards = ""
+	for (a = 1; a <= nsel; a++) {
+		i = sel[a]
+		flags = ""
+		if (tunnelled(i)) {
+			flags = flags "  (tunnel)"
+			forwards = forwards " -L " phost[i] ":" pip[i] ":" phost[i]
+		}
+		if (psvc[i] == dsvc[p] && pcport[i] + 0 == t3[p] + 0) flags = flags "  T3 Code"
+		line = "  " pad(psvc[i], w1) "  " pad(pcport[i], w2) "  " pad(pip[i] ":" phost[i], w3) "  " pad(url(i), w4) flags
+		sub(/ +$/, "", line)
+		print line
+	}
+	if (forwards != "") {
+		print "  tunnel: ssh -N" forwards target
+		all_tunnel = all_tunnel forwards
+	}
+	findings(p)
+	for (a = 1; a <= nnote; a++) print "  note: " note[a]
+}
+
+BEGIN { FS = "|"; n = 0; nproj = 0 }
+
+$1 == "C" {
+	p = project_of($2, $4)
+	f = $6
+	for (k = 7; k <= NF; k++) f = f "|" $k
+	f = clean(f)
+	if (f != "") {
+		if (!(p in folder)) order[++nproj] = p
+		folder[p] = f
+		dsvc[p] = clean($3)
+		if (!(p in t3)) t3[p] = 3774
+		if (f == ENVIRON["DEVC_ROOT"]) mine = p
+	}
+	if ($5 == "true") up[p] = 1
+}
+
+$1 == "E" { v = $6; sub(/^T3_PORT=/, "", v); if (v != "") t3[project_of($2, $4)] = v }
+
+$1 == "P" {
+	# An unset host port is one docker has yet to pick; the IPv6 wildcard is
+	# the twin of an IPv4 line already seen.
+	if ($8 == "" || $7 == "::") next
+	p = project_of($2, $4)
+	ip = ($7 == "") ? "0.0.0.0" : $7
+	key = p SUBSEP ip SUBSEP $8 SUBSEP $6
+	if (key in seen) next
+	seen[key] = 1
+	n++
+	pproj[n] = p; psvc[n] = clean($3); prun[n] = ($5 == "true")
+	split($6, cp, "/"); pcport[n] = cp[1]; pproto[n] = cp[2]
+	pip[n] = ip; phost[n] = $8
+}
+
+END {
+	mode = ENVIRON["DEVC_MODE"]
+	# A number is taken when a running container, or a devcontainer in any
+	# state, publishes it.
+	for (i = 1; i <= n; i++) if (prun[i] || (pproj[i] in folder)) taken[phost[i] + 0] = 1
+
+	if (mode == "check") {
+		if (mine == "") exit 0
+		findings(mine)
+		for (a = 1; a <= nnote; a++) print note[a]
+		exit (nnote > 0)
+	}
+
+	if (ENVIRON["DEVC_SCOPE"] == "all") {
+		# By name, so the listing reads the same on every run.
+		for (i = 2; i <= nproj; i++)
+			for (j = i; j > 1 && label(order[j]) < label(order[j - 1]); j--) {
+				t = order[j]; order[j] = order[j - 1]; order[j - 1] = t
+			}
+	} else {
+		if (mine == "") exit 3
+		order[1] = mine
+		nproj = 1
+	}
+
+	user = ENVIRON["DEVC_SSH_USER"]
+	host = ENVIRON["DEVC_SSH_HOST"]
+	port = ENVIRON["DEVC_SSH_PORT"]
+
+	target = ((port != 22) ? " -p " port : "") " " ((user != "") ? user "@" : "") host
+	all_tunnel = ""
+	if (nproj == 0) print "no devcontainer exists on this host"
+	for (o = 1; o <= nproj; o++) {
+		if (o > 1) print ""
+		print_table(order[o])
+	}
+	if (ENVIRON["DEVC_SCOPE"] == "all" && nproj > 1 && all_tunnel != "") {
+		print ""
+		print "every tunnel at once: ssh -N" all_tunnel target
+	}
+}
+'
+
+cmd_ports() {
+	need_docker
+	port_scan || die 'docker could not list the containers — refusing to guess what is published'
+	ssh_target
+	ports_report table
+	case $? in
+	0) exit 0 ;;
+	3) die 'no devcontainer exists for this checkout — start it with `devc up`' ;;
+	*) die 'could not render the port listing' ;;
+	esac
+}
+
 cmd_exec() {
 	need_docker
 	need_devcontainer
@@ -404,7 +682,21 @@ cmd_doctor() {
 		exit 1
 	fi
 	printf 'ok: container running\n'
-	exec devcontainer exec --workspace-folder "$root" "$BOOTSTRAP" --doctor
+	# A port number shared with another project is a finding about the host,
+	# which the doctor inside cannot see.
+	if port_scan && clashes=$(ports_report check); then
+		printf 'ok: host ports\n'
+		exec devcontainer exec --workspace-folder "$root" "$BOOTSTRAP" --doctor
+	fi
+	if [ -n "${clashes:-}" ]; then
+		printf 'missing: host ports of its own\n'
+		printf '%s\n' "$clashes" | sed 's/^/    /'
+		printf '    change the port in .devcontainer/.env or compose.yaml; `devc ports show-all` shows what is taken\n'
+	else
+		printf 'missing: host ports\n    docker could not list the containers\n'
+	fi
+	devcontainer exec --workspace-folder "$root" "$BOOTSTRAP" --doctor
+	exit 1
 }
 
 case "$verb" in
@@ -421,6 +713,7 @@ firewall)
 	allow) cmd_firewall_allow ;;
 	esac
 	;;
+ports) cmd_ports ;;
 exec) cmd_exec "$@" ;;
 doctor) cmd_doctor ;;
 esac

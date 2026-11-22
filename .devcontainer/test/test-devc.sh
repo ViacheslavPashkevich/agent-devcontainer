@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # test-devc.sh — devc's stub matrix: the daily path cold and warm, each verb,
-# the fence verbs and the identities they run as, the allowlist push, every
-# prerequisite failure, and the usage errors.
+# the fence verbs and the identities they run as, the allowlist push, the port
+# listing and its tunnels, every prerequisite failure, and the usage errors.
 #
 # Run it from anywhere, on the host: bash .devcontainer/test/test-devc.sh
 #
@@ -89,6 +89,11 @@ case "${1:-} ${2:-}" in
 	*" label=devcontainer.local_folder=${STUB_EXPECT_ROOT:?} "*)
 		{ [ -e "$S/running" ] || [ -e "$S/created" ]; } && echo 'c0ffee123456'
 		;;
+	" ps -aq ")
+		# The port scan's listing: every container on the host. The ids are
+		# only handed back to inspect, which answers from the fixture.
+		{ [ -e "$S/running" ] || [ -e "$S/scan" ]; } && echo 'c0ffee123456'
+		;;
 	esac
 	;;
 "inspect "*)
@@ -96,7 +101,24 @@ case "${1:-} ${2:-}" in
 		echo 'docker stub: Error: No such object: c0ffee123456' >&2
 		exit 1
 	}
-	echo 'checkout_devcontainer'
+	case "$*" in
+	*'C|'*)
+		# The port scan: its format is the only one that emits C lines. A case
+		# plants what the host holds in $S/scan; without one the host holds
+		# this checkout's container alone, publishing the T3 port on loopback.
+		[ -n "${DOCKER_STUB_SCAN_FAIL:-}" ] && {
+			echo 'docker stub: Error: No such object' >&2
+			exit 1
+		}
+		if [ -e "$S/scan" ]; then
+			cat "$S/scan"
+		else
+			printf 'C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|%s\n' "$STUB_EXPECT_ROOT"
+			printf 'P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3774/tcp|127.0.0.1|3774\n'
+		fi
+		;;
+	*) echo 'checkout_devcontainer' ;;
+	esac
 	;;
 "stop "*)
 	# The knob's value *is* the status, so a case can assert exact
@@ -172,6 +194,7 @@ reset_world() {
 	unset DOCKER_STUB_INFO_FAIL DOCKER_STUB_NO_COMPOSE DOCKER_STUB_PS_FAIL \
 		DOCKER_STUB_COMPOSE_VERSION DOCKER_STUB_INSPECT_FAIL \
 		DOCKER_STUB_STOP_FAIL DOCKER_STUB_EXEC_RC DOCKER_STUB_PUSH_FAIL \
+		DOCKER_STUB_SCAN_FAIL STUB_SSH_CONNECTION \
 		DEVCONTAINER_STUB_UP_FAIL DEVCONTAINER_STUB_EXEC_RC
 	OUT=''
 	ERR=''
@@ -180,11 +203,16 @@ reset_world() {
 
 # runp <args…> — run the planted script with a hermetic PATH. From a
 # subdirectory of the checkout, deliberately: the root has to come from the
-# script's own location, never from the caller's working directory.
+# script's own location, never from the caller's working directory. The ssh
+# session is a knob of its own name: the suite may itself be running over ssh,
+# and that session must not leak into the cases.
 runp() {
 	capture --cd "$REPO/.devcontainer" env -i \
 		PATH="$CASEBIN:$SAFEBIN" \
 		HOME="$TMP" \
+		USER=operator \
+		${STUB_SSH_CONNECTION+SSH_CONNECTION="$STUB_SSH_CONNECTION"} \
+		${DOCKER_STUB_SCAN_FAIL+DOCKER_STUB_SCAN_FAIL="$DOCKER_STUB_SCAN_FAIL"} \
 		STUB_STATE="$STATE" \
 		STUB_EXPECT_ROOT="$REPO" \
 		${DOCKER_STUB_INFO_FAIL+DOCKER_STUB_INFO_FAIL="$DOCKER_STUB_INFO_FAIL"} \
@@ -210,6 +238,15 @@ FW_ON='docker exec -u dev c0ffee123456 /usr/local/sbin/dev-firewall on'
 FW_OFF='docker exec -u root c0ffee123456 /usr/local/sbin/dev-firewall off'
 FW_ON_ROOT='docker exec -u root c0ffee123456 /usr/local/sbin/dev-firewall on'
 FW_PUSH='docker exec -u root -i c0ffee123456 sh -c cat >/etc/dev-firewall/allowlist'
+SCAN_LIST='docker ps -aq'
+SCAN_INSPECT='docker inspect -f {{$p := index .Config.Labels'
+HOSTNAME_HERE=$(uname -n)
+
+# scan <<'EOF' … — what the port scan finds on the host: C, E and P lines as
+# docker inspect emits them, with @ROOT@ standing for this checkout.
+scan() {
+	sed "s|@ROOT@|$REPO|g" >"$STATE/scan"
+}
 
 # ============================================================================
 # The daily path
@@ -697,9 +734,42 @@ out_has 'ok: docker daemon'
 out_has 'ok: devcontainer CLI'
 out_has 'ok: docker compose (2.27.0)'
 out_has 'ok: container running'
+out_has 'ok: host ports'
 out_hasnt 'missing: '
 called "devcontainer exec --workspace-folder $REPO /usr/local/bin/dev-bootstrap --doctor"
 ok 'the same ok:/missing: protocol as inside, so the two halves read as one report'
+
+case_start 'doctor finds a port number another project also publishes'
+reset_world
+: >"$STATE/running"
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|@ROOT@
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3774/tcp|127.0.0.1|3774
+C|other_devcontainer|app|/other_devcontainer-app-1|true|/srv/other
+P|other_devcontainer|app|/other_devcontainer-app-1|true|3774/tcp|100.64.0.9|3774
+P|other_devcontainer|app|/other_devcontainer-app-1|true|3775/tcp|100.64.0.9|3775
+EOF
+runp doctor
+rc_is 1
+out_has 'missing: host ports of its own'
+out_has '    port 3774 is also published by other (on 100.64.0.9)'
+out_has 'next free: 3776'
+out_has 'devc ports show-all'
+out_hasnt 'ok: host ports'
+called "devcontainer exec --workspace-folder $REPO /usr/local/bin/dev-bootstrap --doctor"
+ok 'a finding on the host does not hide what the inside has to say'
+DEVCONTAINER_STUB_EXEC_RC=0 runp doctor
+rc_is 1
+ok 'a clean inside does not clear the finding'
+
+case_start 'doctor says so when docker cannot list the ports'
+reset_world
+: >"$STATE/running"
+DOCKER_STUB_SCAN_FAIL=1 runp doctor
+rc_is 1
+out_has 'missing: host ports'
+out_has 'docker could not list the containers'
+called "devcontainer exec --workspace-folder $REPO /usr/local/bin/dev-bootstrap --doctor"
 
 case_start 'doctor on a stopped container is a finding, and the inside is not consulted'
 reset_world
@@ -733,6 +803,195 @@ DOCKER_STUB_COMPOSE_VERSION=2.20.0 runp doctor
 rc_is 1
 out_has 'missing: docker compose'
 out_has 'Docker Compose >= 2.24 required (found 2.20.0)'
+
+# ============================================================================
+# ports
+# ============================================================================
+
+case_start 'ports show lists what this project publishes, read from docker'
+reset_world
+: >"$STATE/running"
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|@ROOT@
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3774/tcp|100.64.0.5|3774
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3036/tcp|127.0.0.1|3036
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3000/tcp|127.0.0.1|3001
+C|checkout_devcontainer|postgres|/checkout_devcontainer-postgres-1|true|<no value>
+P|checkout_devcontainer|postgres|/checkout_devcontainer-postgres-1|true|5432/tcp|127.0.0.1|5433
+C|checkout_devcontainer|redis|/checkout_devcontainer-redis-1|true|
+EOF
+runp ports show
+rc_is 0
+err_empty
+out_has_line "checkout — $REPO"
+out_has_line '  SERVICE   INSIDE  PUBLISHED        URL'
+out_has_line '  app       3000    127.0.0.1:3001   http://localhost:3001   (tunnel)'
+out_has_line '  app       3036    127.0.0.1:3036   http://localhost:3036   (tunnel)'
+out_has_line '  app       3774    100.64.0.5:3774  http://100.64.0.5:3774  T3 Code'
+out_has_line '  postgres  5432    127.0.0.1:5433   localhost:5433          (tunnel)'
+ok 'a loopback port is reached through the tunnel, a published address directly'
+ok 'a database gets an address, not a URL a browser would choke on'
+out_has_line "  tunnel: ssh -N -L 3001:127.0.0.1:3001 -L 3036:127.0.0.1:3036 -L 5433:127.0.0.1:5433 operator@$HOSTNAME_HERE"
+ok 'the tunnel forwards each loopback port to the same number, in port order'
+out_hasnt '3774:'
+ok 'a port already on a reachable address is not forwarded'
+out_hasnt 'note:'
+[ "$(calls | wc -l)" -eq 3 ] || die "expected 3 calls, got: $(calls)"
+called "$PREREQS_DOCKER"
+called "$SCAN_LIST"
+called "$SCAN_INSPECT"
+cli_not_called devcontainer
+ok 'one listing and one inspect, and the devcontainer CLI is never needed'
+
+case_start 'over ssh, the tunnel names the address the client dialled'
+STUB_SSH_CONNECTION='203.0.113.7 51234 100.64.0.1 22' runp ports show
+rc_is 0
+out_has ' operator@100.64.0.1'
+out_hasnt ' -p '
+STUB_SSH_CONNECTION='203.0.113.7 51234 100.64.0.1 2222' runp ports show
+out_has ' -p 2222 operator@100.64.0.1'
+ok 'a non-default ssh port is carried into the command'
+
+case_start 'ports show reads the T3 port, wildcard publishes and udp as they are'
+reset_world
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|@ROOT@
+E|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|T3_PORT=3770
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3770/tcp|127.0.0.1|3770
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3774/tcp|127.0.0.1|3774
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|8080/tcp|0.0.0.0|8080
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|8080/tcp|::|8080
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|9999/udp|127.0.0.1|9999
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|4000/tcp||
+EOF
+STUB_SSH_CONNECTION='203.0.113.7 51234 100.64.0.1 22' runp ports show
+rc_is 0
+out_has_line '  app      3770    127.0.0.1:3770  http://localhost:3770   (tunnel)  T3 Code'
+out_has_line '  app      3774    127.0.0.1:3774  http://localhost:3774   (tunnel)'
+ok 'T3 Code is the port the container was told, not the default'
+out_has_line '  app      8080    0.0.0.0:8080    http://100.64.0.1:8080'
+out_counts 1 '8080'
+ok 'a port on every address is reached at the host itself, and its IPv6 twin is not a second row'
+out_has_line '  app      9999    127.0.0.1:9999  udp only'
+out_hasnt '9999:'
+ok 'udp is listed and left out of the tunnel, which cannot carry it'
+out_hasnt '4000'
+ok 'a port docker has not assigned is not invented'
+
+case_start 'ports show notes a number another project also publishes'
+reset_world
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|@ROOT@
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3774/tcp|127.0.0.1|3774
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3000/tcp|127.0.0.1|3000
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|8000/tcp|127.0.0.1|8000
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|9000/tcp|127.0.0.1|9000
+C|alpha_devcontainer|app|/alpha_devcontainer-app-1|true|/srv/alpha
+P|alpha_devcontainer|app|/alpha_devcontainer-app-1|true|3774/tcp|100.64.0.9|3774
+P|alpha_devcontainer|app|/alpha_devcontainer-app-1|true|3775/tcp|100.64.0.9|3775
+C|beta_devcontainer|app|/beta_devcontainer-app-1|false|/srv/beta
+P|beta_devcontainer|app|/beta_devcontainer-app-1|false|3000/tcp||3000
+C|<no value>|<no value>|/leftover|false|<no value>
+P|<no value>|<no value>|/leftover|false|8000/tcp|127.0.0.1|8000
+C||<no value>|/standalone|true|
+P||<no value>|/standalone|true|9000/tcp|127.0.0.1|9000
+EOF
+runp ports show
+rc_is 0
+out_has_line '  note: port 3774 is also published by alpha (on 100.64.0.9) — both start, but 3774 no longer names one project; next free: 3776'
+ok 'the same number on another address still starts, and is still worth changing'
+out_has_line '  note: port 3000 is also published by beta — the two cannot run at once; next free: 3001'
+ok 'a devcontainer that is stopped still owns its ports'
+out_has_line '  note: port 9000 is also published by standalone — the two cannot run at once; next free: 9001'
+ok 'a running container outside compose counts, under its own name'
+out_hasnt 'port 8000 is also'
+ok 'an exited one-off container owns nothing'
+out_counts 3 'note:'
+
+case_start 'ports show-all lists every devcontainer on the host, by name'
+runp ports show-all
+rc_is 0
+out_has_line "checkout — $REPO"
+out_has_line 'alpha — /srv/alpha'
+out_has_line 'beta — /srv/beta (stopped)'
+printf '%s\n' "$OUT" | grep -qE '^(standalone|leftover) ' && die 'a container that is not a devcontainer got a listing'
+ok 'containers that are not devcontainers are not listed'
+[ "$(printf '%s\n' "$OUT" | grep -E '^[a-z]+ — ' | cut -d' ' -f1 | tr '\n' ' ')" = 'alpha beta checkout ' ] ||
+	die 'the projects are not in name order'
+ok 'in name order, so the listing reads the same on every run'
+out_has_line '  app      3000    0.0.0.0:3000  http://'"$HOSTNAME_HERE"':3000'
+ok 'a stopped project shows the ports it is configured to publish'
+out_has_line '  note: port 3774 is also published by checkout (on 127.0.0.1) — both start, but 3774 no longer names one project; next free: 3776'
+out_has_line "every tunnel at once: ssh -N -L 3000:127.0.0.1:3000 -L 3774:127.0.0.1:3774 -L 8000:127.0.0.1:8000 -L 9000:127.0.0.1:9000 operator@$HOSTNAME_HERE"
+
+case_start 'ports show with nothing on loopback offers no tunnel'
+reset_world
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|@ROOT@
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|3774/tcp|100.64.0.5|3774
+EOF
+runp ports show
+rc_is 0
+out_has '100.64.0.5:3774'
+out_hasnt 'tunnel'
+
+case_start 'ports show on a stopped or unpublished project still answers'
+reset_world
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|false|@ROOT@
+P|checkout_devcontainer|app|/checkout_devcontainer-app-1|false|3774/tcp|127.0.0.1|3774
+EOF
+runp ports show
+rc_is 0
+out_has_line "checkout — $REPO (stopped)"
+out_has '127.0.0.1:3774'
+scan <<'EOF'
+C|checkout_devcontainer|app|/checkout_devcontainer-app-1|true|@ROOT@
+EOF
+runp ports show
+rc_is 0
+out_has_line '  no published ports'
+
+case_start 'ports show without a container for this checkout fails plainly'
+reset_world
+runp ports show
+rc_nonzero
+err_has 'no devcontainer exists for this checkout'
+err_has 'devc up'
+out_empty
+scan <<'EOF'
+C|alpha_devcontainer|app|/alpha_devcontainer-app-1|true|/srv/alpha
+P|alpha_devcontainer|app|/alpha_devcontainer-app-1|true|3000/tcp|127.0.0.1|3002
+EOF
+runp ports show
+rc_nonzero
+err_has 'no devcontainer exists for this checkout'
+ok "another project's container is not mistaken for this one"
+runp ports show-all
+rc_is 0
+out_has_line 'alpha — /srv/alpha'
+ok 'show-all answers from any checkout, with or without a container of its own'
+
+case_start 'ports refuses to guess when docker cannot answer'
+reset_world
+: >"$STATE/running"
+DOCKER_STUB_PS_FAIL=1 runp ports show
+rc_nonzero
+err_has 'docker could not list the containers'
+out_empty
+DOCKER_STUB_SCAN_FAIL=1 runp ports show
+rc_nonzero
+err_has 'docker could not list the containers'
+out_empty
+
+case_start 'ports needs docker, not the devcontainer CLI'
+reset_world
+grant docker
+: >"$STATE/running"
+DOCKER_STUB_NO_COMPOSE=1 runp ports show
+rc_is 0
+out_has '127.0.0.1:3774'
+not_called 'compose version'
 
 # ============================================================================
 # Usage
@@ -780,6 +1039,25 @@ rc_is 2
 err_has 'firewall allow takes exactly one domain'
 log_empty
 
+case_start 'ports without a subcommand, or with an unknown one, is a usage error'
+reset_world
+runp ports
+rc_is 2
+err_has 'ports needs a subcommand: show or show-all'
+runp ports all
+rc_is 2
+err_has 'unknown ports subcommand: all'
+runp ports --all
+rc_is 2
+err_has 'unknown ports subcommand: --all'
+runp ports show all
+rc_is 2
+err_has 'ports show takes no arguments'
+runp ports show-all now
+rc_is 2
+err_has 'ports show-all takes no arguments'
+log_empty
+
 case_start 'exec without a command is a usage error'
 reset_world
 runp exec
@@ -794,6 +1072,8 @@ rc_is 0
 out_has 'Usage: devc'
 out_has 'devc rebuild'
 out_has 'devc firewall allow <domain>'
+out_has 'devc ports show '
+out_has 'devc ports show-all'
 out_has 'devc exec dev-bootstrap --update-tools'
 out_hasnt 'update '
 log_empty

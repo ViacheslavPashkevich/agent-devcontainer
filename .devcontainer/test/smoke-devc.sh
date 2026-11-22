@@ -2,8 +2,9 @@
 #
 # smoke-devc.sh — the host entry point exercised against the real running
 # container: the fence verbs with their identities, the allowlist push, exec,
-# the doctor, the T3 Code server as the host sees it, and a stop/up cycle that
-# proves the fence re-arms, and the server comes back, on every start.
+# the doctor, the T3 Code server as the host sees it, the port listing, and a
+# stop/up cycle that proves the fence re-arms, and the server comes back, on
+# every start.
 # Where test-devc.sh proves devc issues the right commands, this proves the
 # commands do what the verbs promise.
 #
@@ -120,6 +121,14 @@ t3_answers() {
 }
 t3_answers
 check $? "the server answers over HTTP at $t3_addr"
+
+case_start 'ports reports what docker actually published'
+ports=$("$DEVC" ports show 2>&1)
+check $? 'devc ports show exits clean' "$ports"
+printf '%s\n' "$ports" | grep -F "$t3_addr" | grep -qF 'T3 Code'
+check $? "it lists $t3_addr and knows it is T3 Code" "$ports"
+"$DEVC" ports show-all | grep -qF "$ROOT"
+check $? 'ports show-all includes this checkout'
 
 case_start 'firewall status reports armed on a running container'
 status_says '^enforcement: armed$'

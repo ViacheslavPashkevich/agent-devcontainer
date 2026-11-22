@@ -79,6 +79,9 @@ devc firewall allow <domain>   allow a domain
 devc firewall on               turn the firewall on
 devc firewall off              turn it off
 
+devc ports show                published ports, their URLs, the ssh tunnel
+devc ports show-all            the same for every devcontainer on the host
+
 devc exec <command...>         run a command inside
 devc doctor                    check the host and the container
 ```
@@ -151,11 +154,27 @@ To connect the T3 app:
 Good to know:
 
 - **Several projects on one host:** give each its own port with `T3_PORT` in
-  `.env`.
+  `.env`. See [Ports](#ports).
 - **From another machine:** set `T3_BIND` in `.env` to an address of the host,
   such as its Tailnet IP, and use that address in the link.
 - **After changing `.env`,** run `devc rebuild`.
 - **Not running?** `devc doctor` says so and shows where the log is.
+
+## Ports
+
+`devc ports show` lists the published ports, a URL for each, and the ssh
+tunnel for the ones marked `(tunnel)`, which only the host can reach:
+
+```text
+myapp — /home/me/myapp
+  SERVICE  INSIDE  PUBLISHED       URL
+  app      3000    127.0.0.1:3000  http://localhost:3000  (tunnel)
+  app      3774    127.0.0.1:3774  http://localhost:3774  (tunnel)  T3 Code
+  tunnel: ssh -N -L 3000:127.0.0.1:3000 -L 3774:127.0.0.1:3774 me@devbox
+```
+
+`devc ports show-all` covers every devcontainer on the host. Use it to pick a
+free port.
 
 ## Customizing
 
