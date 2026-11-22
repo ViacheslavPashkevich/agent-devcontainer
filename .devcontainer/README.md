@@ -38,8 +38,6 @@ npm install -g @devcontainers/cli
 ```
 
 1. Copy this directory into your project as `.devcontainer/`.
-   - *Optional:* set `ref:` in `TEMPLATE` to the tag you copied (needed later
-     for [Upgrading](#upgrading)), then commit.
    - *Optional:* copy `env.example` to `.env` and fill it in. `.env` is
      gitignored.
 2. Run `.devcontainer/host/devc`. The first run builds the image, sets up the
@@ -161,8 +159,8 @@ Good to know:
 
 ## Customizing
 
-Everything you're expected to edit is marked `project section`. You can change
-the rest too, but upgrades are easier if you don't.
+Everything you're expected to edit is marked `project section`. The rest is
+yours to change too.
 
 | File | Section | What goes there |
 | --- | --- | --- |
@@ -200,25 +198,12 @@ In nvim, yanking to `+` or `*` copies to your terminal's clipboard. To paste,
 use your terminal's paste shortcut. Setting `g:clipboard` in your own config
 overrides this.
 
-## Upgrading
-
-`TEMPLATE` records the template repo and the ref you copied.
-
-1. Fetch the template repo and pick a new ref.
-2. Diff its `.devcontainer/` between your recorded ref and the new one.
-3. Apply the diff to your `.devcontainer/`. Conflicts appear only where you
-   edited outside the project sections.
-4. Set `ref:` in `TEMPLATE` to the new ref.
-5. Run the tests, then `devc rebuild`, then the smoke checks; see
-   [test/README.md](test/README.md).
-
 ## Layout
 
 ```text
 devcontainer.json      devcontainer entry point
 compose.yaml           the app service, volumes, your extra services
 Dockerfile             the image
-TEMPLATE               template repo and ref
 env.example            what can go in .env
 firewall/allowlist     allowed domains
 sbin/dev-firewall      the firewall (runs as root)
@@ -228,4 +213,5 @@ bin/dev-bootstrap      installs the tools, sets up yolo mode, git and ssh,
 host/devc              the host command
 etc/                   zsh, nvim and sudo config
 test/                  tests and smoke checks; see test/README.md
+UPGRADING.md           optional: taking the template's later changes
 ```

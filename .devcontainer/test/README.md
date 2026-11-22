@@ -1,6 +1,6 @@
 # Tests
 
-For working on the template, and for checking a copy after an upgrade.
+For working on the template, and for checking a copy after changing it.
 
 ## Unit tests
 
