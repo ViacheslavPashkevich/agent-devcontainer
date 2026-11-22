@@ -3,15 +3,15 @@
 First-run bootstrap for the devcontainer home: the container's
 postCreateCommand, and re-runnable by hand at any time. It provisions
 everything mechanical into the home volume — the operator tools (claude, codex,
-herdr), the herdr integrations for both harnesses, the harness permission
-posture, git identity, the SSH identity and its client configuration — and
-then reports every credential it cannot provision itself, each with the
-command that fixes it. See README.md.
+herdr, t3), the herdr integrations for both harnesses, the harness permission
+posture, git identity, the SSH identity and its client configuration — starts
+the T3 Code server, and then reports every credential it cannot provision
+itself, each with the command that fixes it. See README.md.
 
 Python, standard library only, and container-only: the posture it writes is
 exactly what must never reach a host, python3 is baseline in the image, and
 the two structured-file edits (a JSON merge and a TOML reconcile) are the whole
-job. Everything external — npm, the herdr installer, herdr, git, codex, ssh — is
+job. Everything external — npm, the installers, herdr, git, codex, ssh — is
 a captured subprocess whose accepted exit statuses are stated at the call
 site, so a failure can never be mistaken for "already converged".
 
@@ -19,6 +19,7 @@ Lives in the image at /usr/local/bin/dev-bootstrap. Runs as dev; nothing here
 needs root.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -29,7 +30,7 @@ import tempfile
 from pathlib import Path
 
 USAGE = """\
-Usage: dev-bootstrap [--doctor | --update-tools]
+Usage: dev-bootstrap [--doctor | --update-tools | --start-t3]
 
   (no flags)      Provision the container home, then report credentials.
                   Exits non-zero only when provisioning itself failed:
@@ -38,9 +39,11 @@ Usage: dev-bootstrap [--doctor | --update-tools]
                   would fail container creation.
   --doctor        Report only, writing nothing. Exits 1 when anything is
                   missing, 0 when the environment is ready.
-  --update-tools  Reinstall claude, codex and herdr at their current
+  --update-tools  Reinstall claude, codex, herdr and t3 at their current
                   versions, then refresh the herdr integrations. No
                   rebuild: the tools live in the home volume.
+  --start-t3      Start the T3 Code server unless it is already running.
+                  The container runs this at every start.
 """
 
 
@@ -92,12 +95,26 @@ SSH_KEY = SSH_DIR / "id_devcontainer"
 SSH_CONFIG = SSH_DIR / "config"
 
 # The operator tools, and where they come from. The two harness CLIs share the
-# npm registry as their one channel; herdr has no packaged channel on Linux, so
-# its upstream installer is given a directory under the home. All three land in
-# ~/.local/bin, which the image puts on PATH.
+# npm registry as their one channel; herdr and t3 have no packaged channel on
+# Linux, so each upstream installer is given a directory under the home, through
+# the variable it reads. All four land in ~/.local/bin, which the image puts on
+# PATH. t3 keeps its versions under ~/.t3, its installer's default.
 NPM_TOOLS = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
-HERDR_INSTALLER = "https://herdr.dev/install.sh"
-TOOLS = ("claude", "codex", "herdr")
+SCRIPT_TOOLS = {
+    "herdr": ("https://herdr.dev/install.sh", "HERDR_INSTALL_DIR"),
+    "t3": ("https://t3.codes/install.sh", "T3CODE_INSTALL_BIN_DIR"),
+}
+TOOLS = (*NPM_TOOLS, *SCRIPT_TOOLS)
+
+# The T3 Code server. The port is the same inside and out (compose publishes
+# T3_PORT on T3_PORT), so the address a client pairs with is the host's
+# address and this port. The lock is held by the server process for its whole
+# life: it is what makes a start idempotent, and what the doctor reads.
+T3_DIR = HOME / ".t3"
+T3_LOG = T3_DIR / "serve.log"
+T3_LOCK = T3_DIR / "serve.lock"
+T3_DEFAULT_PORT = "3774"
+WORKSPACE = "/workspace"
 
 # The one provider host this script owns, and the directives it writes for it.
 # The IdentityFile value is the literal tilde form: ssh expands it itself, and
@@ -174,22 +191,23 @@ def install_npm_tools():
         raise Failure(tool_failure(NPM_TOOLS), out + err)
 
 
-def install_herdr():
+def install_from_script(name):
     # Downloaded to a file and then run, never piped: a curl that fails
     # mid-stream would otherwise hand the shell half an installer. The
     # installer is given its directory explicitly, so it never reaches for
     # /usr/local or writes PATH advice into a dotfile.
+    url, dir_var = SCRIPT_TOOLS[name]
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
-    fd, script = tempfile.mkstemp(prefix="herdr-install.", suffix=".sh")
+    fd, script = tempfile.mkstemp(prefix=f"{name}-install.", suffix=".sh")
     os.close(fd)
     try:
-        out, err, code = run("curl", "-fsSL", HERDR_INSTALLER, "-o", script)
+        out, err, code = run("curl", "-fsSL", url, "-o", script)
         if code != 0:
-            raise Failure(tool_failure(["herdr"]), out + err)
-        env = dict(os.environ, HERDR_INSTALL_DIR=str(LOCAL_BIN))
+            raise Failure(tool_failure([name]), out + err)
+        env = dict(os.environ, **{dir_var: str(LOCAL_BIN)})
         out, err, code = run("/bin/sh", script, env=env)
         if code != 0:
-            raise Failure(tool_failure(["herdr"]), out + err)
+            raise Failure(tool_failure([name]), out + err)
     finally:
         try:
             os.unlink(script)
@@ -213,14 +231,16 @@ def provision_tools(force=False):
             )
         for t in npm_wanted:
             print(f"{verb}: {t}")
-    if force or not tool_present("herdr"):
-        install_herdr()
-        if not tool_present("herdr"):
+    for name in SCRIPT_TOOLS:
+        if not force and tool_present(name):
+            continue
+        install_from_script(name)
+        if not tool_present(name):
             raise Failure(
-                tool_failure(["herdr"]),
-                f"the installer reported success but herdr did not appear on PATH — expected at {LOCAL_BIN / 'herdr'}",
+                tool_failure([name]),
+                f"the installer reported success but {name} did not appear on PATH — expected at {LOCAL_BIN / name}",
             )
-        print(f"{verb}: herdr")
+        print(f"{verb}: {name}")
 
 
 def install_integrations():
@@ -506,6 +526,67 @@ def provision_ssh_config():
         provisioned(f"ssh config ({host})")
 
 
+# --- the T3 Code server ----------------------------------------------------
+
+
+def t3_port():
+    port = os.environ.get("T3_PORT", "").strip() or T3_DEFAULT_PORT
+    if not port.isdigit() or not 0 < int(port) < 65536:
+        raise Failure(f"T3_PORT is not a port number: {port}")
+    return port
+
+
+def t3_running():
+    """Whether a server holds the lock. Read-only: a missing lock file means no
+    server has ever started in this home, and nothing is created to find out."""
+    try:
+        fd = os.open(T3_LOCK, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def start_t3():
+    """Start the server in its own session, detached from whatever ran this —
+    the compose command at container start, or a postCreateCommand exec that
+    is about to end. The server inherits the lock and holds it until it exits,
+    so a second start while it runs is a no-op rather than a second server
+    clobbering the first one's log. Bound to every interface inside the
+    container: compose decides what the host exposes."""
+    if not tool_present("t3"):
+        # The first start of a fresh home volume: the compose command runs
+        # before the bootstrap has installed anything. The bootstrap starts
+        # the server itself once t3 is in place.
+        print("t3 server: t3 is not installed yet")
+        return
+    port = t3_port()
+    T3_DIR.mkdir(parents=True, exist_ok=True)
+    lock = os.open(T3_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        with open(T3_LOG, "w") as log:
+            subprocess.Popen(
+                ["t3", "serve", "--host", "0.0.0.0", "--port", port, WORKSPACE],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+                pass_fds=(lock,),
+            )
+    finally:
+        os.close(lock)
+    print(f"started: t3 server (port {port})")
+
+
 def provision():
     step(tool_failure(TOOLS), provision_tools)
     step("could not install the herdr integrations", install_integrations)
@@ -516,6 +597,7 @@ def provision():
     step("could not add safe.directory", allow_safe_directory)
     step(ssh_key_failure(), provision_ssh_key)
     step(f"could not provision the ssh client configuration: {SSH_CONFIG}", provision_ssh_config)
+    step(f"could not start the t3 server — see {T3_LOG}", start_t3)
 
 
 def update_tools():
@@ -524,6 +606,11 @@ def update_tools():
     # a new herdr may install them differently — so a tool update refreshes
     # them too.
     step("could not install the herdr integrations", install_integrations)
+    # A running server keeps the binary it started with; replacing it here
+    # would cut off every client, the one that may have asked for this update
+    # included.
+    if t3_running():
+        print("note: the running t3 server picks up the new version when the container restarts")
 
 
 # --- doctor -----------------------------------------------------------------
@@ -570,6 +657,17 @@ def check_tools():
             check_missing(name)
             fix("the operator tools live in the home volume and the bootstrap installs them:")
             fix("dev-bootstrap")
+
+
+def check_t3_server():
+    if t3_running():
+        check_ok(f"t3 server (port {os.environ.get('T3_PORT', '').strip() or T3_DEFAULT_PORT})")
+        return
+    check_missing("t3 server")
+    fix("it starts with the container; its log says why it did not:")
+    fix(f"cat {T3_LOG}")
+    fix("then start it again:")
+    fix("dev-bootstrap --start-t3")
 
 
 def git_identity():
@@ -639,6 +737,7 @@ def check_ssh(host):
 
 def doctor():
     check_tools()
+    check_t3_server()
 
     # No `claude login status` equivalent exists, so this is the credential
     # store's path: inside the container that is always Linux, where claude
@@ -680,12 +779,11 @@ def doctor():
 
 
 def main(argv):
+    modes = {"--doctor": "doctor", "--update-tools": "update-tools", "--start-t3": "start-t3"}
     mode = "provision"
     for arg in argv:
-        if arg == "--doctor":
-            mode = "doctor"
-        elif arg == "--update-tools":
-            mode = "update-tools"
+        if arg in modes:
+            mode = modes[arg]
         elif arg in ("-h", "--help"):
             print(USAGE, end="")
             return 0
@@ -693,8 +791,9 @@ def main(argv):
             print(f"dev-bootstrap: unknown argument: {arg}", file=sys.stderr)
             print(USAGE, end="", file=sys.stderr)
             return 2
-    if "--doctor" in argv and "--update-tools" in argv:
-        print("dev-bootstrap: --doctor and --update-tools are mutually exclusive", file=sys.stderr)
+    given = [arg for arg in modes if arg in argv]
+    if len(given) > 1:
+        print(f"dev-bootstrap: {' and '.join(given)} are mutually exclusive", file=sys.stderr)
         print(USAGE, end="", file=sys.stderr)
         return 2
 
@@ -709,6 +808,10 @@ def main(argv):
 
     if mode == "update-tools":
         update_tools()
+        return 1 if prov_failed else 0
+
+    if mode == "start-t3":
+        step(f"could not start the t3 server — see {T3_LOG}", start_t3)
         return 1 if prov_failed else 0
 
     if mode == "provision":

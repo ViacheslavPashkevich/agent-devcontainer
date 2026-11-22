@@ -17,9 +17,13 @@
 #     volume, the state this script exists to provision — and its .local/bin
 #     leads the hermetic PATH, as the image's PATH does.
 #   - The safe bin's `python3` is the subject's own interpreter, not a stub.
-#     Its subprocesses — npm, curl, the herdr installer, herdr, codex, claude,
-#     git, ssh-keygen and ssh — are the stubs, except git, which is real: the
-#     identity steps are about what lands in .gitconfig.
+#     Its subprocesses — npm, curl, the herdr and t3 installers, herdr, t3,
+#     codex, claude, git, ssh-keygen and ssh — are the stubs, except git, which
+#     is real: the identity steps are about what lands in .gitconfig.
+#   - The t3 stub's `serve` is a real long-running process, as the server is:
+#     it holds the lock the subject hands it until the suite kills it, so
+#     "already running" is a state a case can be in. Its start is detached
+#     from the subject, so its call-log line is waited for, never assumed.
 #   - The npm and curl stubs *install*: they plant the tool stubs into the
 #     scratch home's .local/bin, so "the binaries appear on PATH after the
 #     install" is observed, and an installer that lies can be simulated.
@@ -53,11 +57,21 @@ KEYGEN_CALL="ssh-keygen -t rsa -b 4096 -N $EMPTY -C devcontainer -q -f $HOMEDIR/
 # that carries it, which is where "the probe is non-interactive" is asserted.
 PROBE_GITHUB='ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com'
 
-# The installs. The npm one is exact; the curl one ends in a temporary path, so
-# it is matched as a prefix, and the installer logs its own line once it runs.
+# The installs. The npm one is exact; the curl ones end in a temporary path, so
+# they are matched as a prefix, and each installer logs its own line once it
+# runs.
 NPM_INSTALL="npm install -g --prefix $HOMEDIR/.local @anthropic-ai/claude-code @openai/codex"
-CURL_INSTALLER='curl -fsSL https://herdr.dev/install.sh -o '
+CURL_HERDR='curl -fsSL https://herdr.dev/install.sh -o '
 HERDR_INSTALLER_RAN="herdr-installer HERDR_INSTALL_DIR=$LOCAL_BIN"
+CURL_T3='curl -fsSL https://t3.codes/install.sh -o '
+T3_INSTALLER_RAN="t3-installer T3CODE_INSTALL_BIN_DIR=$LOCAL_BIN"
+
+# The server start, on the default port.
+T3_SERVE='t3 serve --host 0.0.0.0 --port 3774 /workspace'
+
+# Every long-running process a case starts — stub servers and lock holders —
+# so the next case, and the end of the run, can stop them.
+SERVER_PIDS="$TMP/server.pids"
 
 # --- stubs ------------------------------------------------------------------
 
@@ -103,6 +117,30 @@ case "${1:-} ${2:-}" in
 	;;
 *)
 	echo "herdr stub: unsupported: $*" >&2
+	exit 2
+	;;
+esac
+exit 0
+STUB
+
+cat >"$STUBS/t3" <<'STUB'
+#!/bin/sh
+set -u
+S=${STUB_STATE:?}
+printf 't3 %s\n' "$*" >>"$S/calls.log"
+case "${1:-}" in
+--version)
+	echo 't3 v0.1.4'
+	;;
+serve)
+	# Runs until it is killed, like the real server, and keeps whatever
+	# descriptors it was handed — the lock among them.
+	echo 't3 stub: serving'
+	printf '%s\n' "$$" >>"${STUB_PIDS:?}"
+	exec sleep 300
+	;;
+*)
+	echo "t3 stub: unsupported: $*" >&2
 	exit 2
 	;;
 esac
@@ -180,46 +218,59 @@ ln -sf "${STUB_DIR:?}/codex" "$prefix/bin/codex"
 exit 0
 STUB
 
-# herdr.dev, as far as this suite is concerned: `curl -o <file>` writes an
-# installer script there, and that script — run by the subject through /bin/sh,
-# with HERDR_INSTALL_DIR in its environment — plants the herdr stub and logs
-# that it ran. CURL_STUB_FAIL fails the download; HERDR_INSTALLER_STUB_FAIL
-# makes the installer fail; HERDR_INSTALLER_STUB_ELSEWHERE makes it ignore the
-# directory it was given and still exit 0.
+# herdr.dev and t3.codes, as far as this suite is concerned: `curl -o <file>`
+# writes an installer script there, and that script — run by the subject
+# through /bin/sh, with the tool's install-directory variable in its
+# environment — plants the tool's stub and logs that it ran. CURL_STUB_FAIL
+# fails the download; INSTALLER_STUB_FAIL makes the installer fail;
+# INSTALLER_STUB_ELSEWHERE makes it ignore the directory it was given and
+# still exit 0.
 cat >"$STUBS/curl" <<'STUB'
 #!/bin/sh
 set -u
 S=${STUB_STATE:?}
 printf 'curl %s\n' "$*" >>"$S/calls.log"
 echo 'curl stub: downloading'
-[ -n "${CURL_STUB_FAIL:-}" ] && {
-	echo 'curl stub: (6) Could not resolve host: herdr.dev' >&2
-	exit 6
-}
 out=''
+url=''
 prev=''
 for a in "$@"; do
 	[ "$prev" = -o ] && out=$a
+	case "$a" in https://*) url=$a ;; esac
 	prev=$a
 done
+case "$url" in
+https://herdr.dev/install.sh) name=herdr var=HERDR_INSTALL_DIR ;;
+https://t3.codes/install.sh) name=t3 var=T3CODE_INSTALL_BIN_DIR ;;
+*)
+	echo "curl stub: unsupported URL: $url" >&2
+	exit 2
+	;;
+esac
+[ -n "${CURL_STUB_FAIL:-}" ] && {
+	host=${url#https://}
+	echo "curl stub: (6) Could not resolve host: ${host%%/*}" >&2
+	exit 6
+}
 [ -n "$out" ] || {
 	echo 'curl stub: no -o' >&2
 	exit 2
 }
-cat >"$out" <<'INSTALLER'
-#!/bin/sh
+printf '#!/bin/sh\nname=%s\nvar=%s\n' "$name" "$var" >"$out"
+cat >>"$out" <<'INSTALLER'
 set -u
 S=${STUB_STATE:?}
-printf 'herdr-installer HERDR_INSTALL_DIR=%s\n' "${HERDR_INSTALL_DIR:-unset}" >>"$S/calls.log"
-echo 'herdr installer stub: installing'
-[ -n "${HERDR_INSTALLER_STUB_FAIL:-}" ] && {
-	echo 'herdr installer stub: no release for this platform' >&2
+eval "dir=\${$var:-unset}"
+printf '%s-installer %s=%s\n' "$name" "$var" "$dir" >>"$S/calls.log"
+echo "$name installer stub: installing"
+[ -n "${INSTALLER_STUB_FAIL:-}" ] && {
+	echo "$name installer stub: no release for this platform" >&2
 	exit 1
 }
-dir=${HERDR_INSTALL_DIR:?}
-[ -n "${HERDR_INSTALLER_STUB_ELSEWHERE:-}" ] && dir="$dir/../elsewhere"
+[ "$dir" != unset ] || exit 2
+[ -n "${INSTALLER_STUB_ELSEWHERE:-}" ] && dir="$dir/../elsewhere"
 mkdir -p "$dir"
-ln -sf "${STUB_DIR:?}/herdr" "$dir/herdr"
+ln -sf "${STUB_DIR:?}/$name" "$dir/$name"
 exit 0
 INSTALLER
 exit 0
@@ -317,9 +368,28 @@ install_tools() {
 	ln -sf "$STUBS/claude" "$LOCAL_BIN/claude"
 	ln -sf "$STUBS/codex" "$LOCAL_BIN/codex"
 	ln -sf "$STUBS/herdr" "$LOCAL_BIN/herdr"
+	ln -sf "$STUBS/t3" "$LOCAL_BIN/t3"
 }
 
+# kill_servers — stop every server a case left running, and wait for each to
+# be gone: the lock is released only when its last holder exits.
+kill_servers() {
+	local pid i
+	[ -f "$SERVER_PIDS" ] || return 0
+	for pid in $(cat "$SERVER_PIDS"); do
+		kill "$pid" 2>/dev/null || continue
+		i=0
+		while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+			sleep 0.05
+			i=$((i + 1))
+		done
+	done
+	rm -f "$SERVER_PIDS"
+}
+trap 'kill_servers; rm -rf "$TMP"' EXIT INT TERM
+
 reset_world() {
+	kill_servers
 	rm -rf "$STATE" "$HOMEDIR"
 	mkdir -p "$STATE" "$HOMEDIR"
 	install_tools
@@ -327,9 +397,9 @@ reset_world() {
 	SENTINEL="$TMP/sentinel"
 	unset HERDR_STUB_INSTALL_FAIL CODEX_STUB_LOGIN_RC CLAUDE_STUB_VERSION_FAIL \
 		NPM_STUB_FAIL NPM_STUB_ELSEWHERE CURL_STUB_FAIL \
-		HERDR_INSTALLER_STUB_FAIL HERDR_INSTALLER_STUB_ELSEWHERE \
+		INSTALLER_STUB_FAIL INSTALLER_STUB_ELSEWHERE \
 		SSH_KEYGEN_STUB_FAIL SSH_STUB_GITHUB \
-		GIT_USER_NAME GIT_USER_EMAIL
+		GIT_USER_NAME GIT_USER_EMAIL T3_PORT
 	OUT=''
 	ERR=''
 	RC=0
@@ -361,6 +431,28 @@ give_identity_config() {
 # The registration the bootstrap cannot do itself, as a fixture.
 give_ssh_ok() { SSH_STUB_GITHUB=authenticated; }
 
+# A server already running, for the cases that check without provisioning:
+# --doctor starts nothing. Only the lock matters to the subject, so the
+# fixture is a process holding it, ready once it says so.
+give_t3_server() {
+	local i=0
+	mkdir -p "$HOMEDIR/.t3"
+	rm -f "$TMP/holder.ready"
+	python3 -c '
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").write("ready\n")
+time.sleep(300)
+' "$HOMEDIR/.t3/serve.lock" "$TMP/holder.ready" &
+	printf '%s\n' "$!" >>"$SERVER_PIDS"
+	while [ ! -s "$TMP/holder.ready" ]; do
+		i=$((i + 1))
+		[ "$i" -le 100 ] || die 'the lock holder never took the lock'
+		sleep 0.05
+	done
+}
+
 give_everything() {
 	give_claude_auth
 	give_codex_auth
@@ -379,15 +471,17 @@ runp() {
 		GIT_CONFIG_NOSYSTEM=1 \
 		STUB_STATE="$STATE" \
 		STUB_DIR="$STUBS" \
+		STUB_PIDS="$SERVER_PIDS" \
 		DEV_BOOTSTRAP_SENTINEL="$SENTINEL" \
+		${T3_PORT+T3_PORT="$T3_PORT"} \
 		${HERDR_STUB_INSTALL_FAIL+HERDR_STUB_INSTALL_FAIL="$HERDR_STUB_INSTALL_FAIL"} \
 		${CODEX_STUB_LOGIN_RC+CODEX_STUB_LOGIN_RC="$CODEX_STUB_LOGIN_RC"} \
 		${CLAUDE_STUB_VERSION_FAIL+CLAUDE_STUB_VERSION_FAIL="$CLAUDE_STUB_VERSION_FAIL"} \
 		${NPM_STUB_FAIL+NPM_STUB_FAIL="$NPM_STUB_FAIL"} \
 		${NPM_STUB_ELSEWHERE+NPM_STUB_ELSEWHERE="$NPM_STUB_ELSEWHERE"} \
 		${CURL_STUB_FAIL+CURL_STUB_FAIL="$CURL_STUB_FAIL"} \
-		${HERDR_INSTALLER_STUB_FAIL+HERDR_INSTALLER_STUB_FAIL="$HERDR_INSTALLER_STUB_FAIL"} \
-		${HERDR_INSTALLER_STUB_ELSEWHERE+HERDR_INSTALLER_STUB_ELSEWHERE="$HERDR_INSTALLER_STUB_ELSEWHERE"} \
+		${INSTALLER_STUB_FAIL+INSTALLER_STUB_FAIL="$INSTALLER_STUB_FAIL"} \
+		${INSTALLER_STUB_ELSEWHERE+INSTALLER_STUB_ELSEWHERE="$INSTALLER_STUB_ELSEWHERE"} \
 		${SSH_KEYGEN_STUB_FAIL+SSH_KEYGEN_STUB_FAIL="$SSH_KEYGEN_STUB_FAIL"} \
 		${SSH_STUB_GITHUB+SSH_STUB_GITHUB="$SSH_STUB_GITHUB"} \
 		${GIT_USER_NAME+GIT_USER_NAME="$GIT_USER_NAME"} \
@@ -440,6 +534,18 @@ claude_key_is() {
 	ok "settings.json keeps $* = $want"
 }
 
+# wait_called <line> — the server is started detached, so its stub logs its
+# call on its own schedule; a bounded wait, never a sleep and a hope.
+wait_called() {
+	local i=0
+	while ! calls | grep -qF -- "$1"; do
+		i=$((i + 1))
+		[ "$i" -le 100 ] || die "never called: $1"
+		sleep 0.05
+	done
+	ok "called: $1"
+}
+
 tool_on_path() {
 	[ -L "$LOCAL_BIN/$1" ] || [ -x "$LOCAL_BIN/$1" ] || die "$1 did not land in $LOCAL_BIN"
 	ok "$1 is installed at $LOCAL_BIN/$1"
@@ -449,7 +555,7 @@ tool_on_path() {
 # A fresh home volume
 # ============================================================================
 
-case_start 'a fresh home volume gets the tools, integrations, posture, identity, safe.directory and the ssh identity'
+case_start 'a fresh home volume gets the tools, integrations, posture, identity, safe.directory, the ssh identity and a running t3 server'
 reset_world
 rm -rf "$HOMEDIR/.local"
 give_everything
@@ -457,17 +563,22 @@ runp
 rc_is 0
 # The installs come first: everything after them runs the tools they install.
 called "$NPM_INSTALL"
-called "$CURL_INSTALLER"
+called "$CURL_HERDR"
 called "$HERDR_INSTALLER_RAN"
+called "$CURL_T3"
+called "$T3_INSTALLER_RAN"
 called_before "$NPM_INSTALL" 'herdr integration status'
 called_before "$HERDR_INSTALLER_RAN" 'herdr integration status'
-ok 'both channels run before anything that needs the tools'
+called_before "$T3_INSTALLER_RAN" 'herdr integration status'
+ok 'every channel runs before anything that needs the tools'
 out_has_line 'provisioned: claude'
 out_has_line 'provisioned: codex'
 out_has_line 'provisioned: herdr'
+out_has_line 'provisioned: t3'
 tool_on_path claude
 tool_on_path codex
 tool_on_path herdr
+tool_on_path t3
 ok 'the installs land in the home volume, where a rebuild cannot touch them'
 called 'herdr integration status'
 called 'herdr integration install claude'
@@ -513,20 +624,28 @@ file_counts 1 "$HOMEDIR/.ssh/config" '^  IdentitiesOnly yes$'
 no_file "$HOMEDIR/.ssh/known_hosts"
 file_hasnt "$HOMEDIR/.ssh/config" 'StrictHostKeyChecking'
 file_hasnt "$HOMEDIR/.ssh/config" 'UserKnownHostsFile'
-out_counts 7 'ok: '
+wait_called "$T3_SERVE"
+out_has_line 'started: t3 server (port 3774)'
+[ -f "$HOMEDIR/.t3/serve.log" ] || die 'no server log at ~/.t3/serve.log'
+ok 'the server writes its log to ~/.t3/serve.log'
+out_counts 9 'ok: '
 out_hasnt 'missing: '
 ok 'the doctor is clean once every credential is in place'
 out_has 'ok: claude (2.1.0 (Claude Code))'
 out_has 'ok: codex (codex-cli 0.50.0)'
 out_has 'ok: herdr (herdr 0.9.0)'
+out_has 'ok: t3 (t3 v0.1.4)'
 ok 'the report names the installed versions'
+out_has_line 'ok: t3 server (port 3774)'
+ok 'the server the run just started is reported running'
 out_hasnt 'npm stub:'
 out_hasnt 'curl stub:'
 out_hasnt 'installer stub:'
 out_hasnt 'ssh-keygen stub:'
 out_hasnt 'ssh stub:'
 out_hasnt 'herdr stub:'
-ok 'neither the installers nor the probes leak chatter into the output'
+out_hasnt 't3 stub:'
+ok 'neither the installers, the server nor the probes leak chatter into the output'
 
 case_start 'a second run changes nothing'
 # Continues from the case above deliberately: the state under test is exactly
@@ -553,9 +672,13 @@ log_is \
 	'claude --version' \
 	'codex --version' \
 	'herdr --version' \
+	't3 --version' \
 	'codex login status' \
 	"$PROBE_GITHUB"
-ok 'the tools are present, so neither installer runs; the integrations report current, so install never runs again'
+ok 'the tools are present, so no installer runs; the integrations report current, so install never runs again'
+ok 'the server from the first run is still up, so no second one starts'
+out_hasnt 'started: '
+out_has_line 'ok: t3 server (port 3774)'
 not_called 'ssh-keygen'
 ok 'the existing key is never regenerated'
 out_hasnt 'provisioned: '
@@ -590,9 +713,11 @@ give_everything
 runp
 rc_is 0
 cli_not_called npm
-called "$CURL_INSTALLER"
+called "$CURL_HERDR"
 called "$HERDR_INSTALLER_RAN"
+not_called "$CURL_T3"
 out_has_line 'provisioned: herdr'
+out_hasnt_line 'provisioned: t3'
 out_hasnt_line 'provisioned: claude'
 out_hasnt_line 'provisioned: codex'
 tool_on_path herdr
@@ -614,29 +739,36 @@ rm -f "$LOCAL_BIN/herdr"
 give_everything
 runp
 rc_is 0
-called_before "$CURL_INSTALLER" "$HERDR_INSTALLER_RAN"
+called_before "$CURL_HERDR" "$HERDR_INSTALLER_RAN"
 ok 'download completes before anything executes'
 installer_path=$(calls | sed -n 's/^curl -fsSL https:\/\/herdr.dev\/install.sh -o //p')
 [ -n "$installer_path" ] || die 'the installer path was not captured'
 no_file "$installer_path"
 ok 'the downloaded installer is removed afterwards'
 
-case_start '--update-tools reinstalls all three and refreshes the integrations, and nothing else'
+case_start '--update-tools reinstalls all four and refreshes the integrations, and nothing else'
 reset_world
 give_everything
 runp
 rc_is 0
+wait_called "$T3_SERVE"
 : >"$STATE/calls.log"
 sleep 1
 before_settings=$(mtime "$HOMEDIR/.claude/settings.json")
 runp --update-tools
 rc_is 0
 called "$NPM_INSTALL"
-called "$CURL_INSTALLER"
+called "$CURL_HERDR"
 called "$HERDR_INSTALLER_RAN"
+called "$CURL_T3"
+called "$T3_INSTALLER_RAN"
 out_has_line 'updated: claude'
 out_has_line 'updated: codex'
 out_has_line 'updated: herdr'
+out_has_line 'updated: t3'
+not_called 't3 serve'
+out_has 'note: the running t3 server picks up the new version when the container restarts'
+ok 'the running server is left alone: replacing it would cut off its clients'
 out_hasnt 'provisioned: '
 called 'herdr integration status'
 ok 'the integrations are re-checked: a new herdr may install its hooks differently'
@@ -677,8 +809,11 @@ cli_not_called curl
 out_has_line 'missing: claude'
 out_has_line 'missing: codex'
 out_has_line 'missing: herdr'
+out_has_line 'missing: t3'
 out_matches '^ +dev-bootstrap$'
 ok 'the doctor names the tools and the one command that installs them'
+out_has_line 't3 server: t3 is not installed yet'
+not_called 't3 serve'
 claude_mode_is bypassPermissions
 ok 'the posture still lands'
 
@@ -695,7 +830,7 @@ out_hasnt_line 'provisioned: herdr'
 reset_world
 rm -f "$LOCAL_BIN/herdr"
 give_everything
-HERDR_INSTALLER_STUB_FAIL=1 runp
+INSTALLER_STUB_FAIL=1 runp
 rc_nonzero
 err_has 'could not install the operator tools: herdr'
 err_has 'no release for this platform'
@@ -715,7 +850,7 @@ out_hasnt_line 'provisioned: claude'
 reset_world
 rm -f "$LOCAL_BIN/herdr"
 give_everything
-HERDR_INSTALLER_STUB_ELSEWHERE=1 runp
+INSTALLER_STUB_ELSEWHERE=1 runp
 rc_nonzero
 err_has 'could not install the operator tools: herdr'
 err_has 'did not appear on PATH'
@@ -977,18 +1112,21 @@ missing_only() {
 	reset_world
 	give_everything
 	give_identity_config
+	[ "$1" = 't3 server' ] || give_t3_server
 	case "$1" in
 	'claude auth') rm -f "$HOMEDIR/.claude/.credentials.json" ;;
 	'codex auth') CODEX_STUB_LOGIN_RC=1 ;;
 	'git identity') rm -f "$HOMEDIR/.gitconfig" ;;
 	'herdr') rm -f "$LOCAL_BIN/herdr" ;;
+	't3') rm -f "$LOCAL_BIN/t3" ;;
+	't3 server') ;;
 	*) die "no such credential: $1" ;;
 	esac
 	runp --doctor
 	rc_is 1
 	out_counts 1 'missing: '
 	out_has "missing: $1"
-	out_counts 6 'ok: '
+	out_counts 8 'ok: '
 }
 
 case_start 'doctor: claude auth missing, and nothing else'
@@ -1016,11 +1154,22 @@ out_matches '^ +dev-bootstrap$'
 cli_not_called curl
 cli_not_called npm
 ok 'report only: --doctor writes nothing, installs included'
+missing_only 't3'
+cli_not_called curl
+
+case_start 'doctor: a server that is not running is a finding, with its log and the start command'
+missing_only 't3 server'
+out_has_line 'missing: t3 server'
+out_matches '^ +cat .*/\.t3/serve\.log$'
+out_matches '^ +dev-bootstrap --start-t3$'
+not_called 't3 serve'
+ok 'report only: --doctor never starts the server'
 
 case_start 'doctor: a tool whose version cannot be read is still present'
 reset_world
 give_everything
 give_identity_config
+give_t3_server
 CLAUDE_STUB_VERSION_FAIL=1 runp --doctor
 rc_is 0
 out_matches '^ok: claude$'
@@ -1033,11 +1182,13 @@ rm -rf "$HOMEDIR/.local"
 grant ssh-keygen ssh
 runp --doctor
 rc_is 1
-out_counts 7 'missing: '
+out_counts 9 'missing: '
 out_hasnt 'ok: '
 out_has_line 'missing: claude'
 out_has_line 'missing: codex'
 out_has_line 'missing: herdr'
+out_has_line 'missing: t3'
+out_has_line 'missing: t3 server'
 out_has 'missing: claude auth'
 out_has 'missing: codex auth'
 out_has 'missing: git identity'
@@ -1048,11 +1199,12 @@ case_start 'doctor: the ok/missing protocol is the whole output'
 reset_world
 give_everything
 give_identity_config
+give_t3_server
 runp --doctor
 rc_is 0
-out_counts 7 'ok: '
+out_counts 9 'ok: '
 out_hasnt 'missing: '
-log_is 'claude --version' 'codex --version' 'herdr --version' 'codex login status' "$PROBE_GITHUB"
+log_is 'claude --version' 'codex --version' 'herdr --version' 't3 --version' 'codex login status' "$PROBE_GITHUB"
 out_hasnt 'codex stub: Logged in using ChatGPT'
 out_hasnt 'herdr stub:'
 out_hasnt 'ssh stub:'
@@ -1066,6 +1218,7 @@ case_start 'doctor: a host that refuses the shell without a message is still suc
 reset_world
 give_everything
 give_identity_config
+give_t3_server
 SSH_STUB_GITHUB=shell-refused runp --doctor
 rc_is 0
 out_has 'ok: ssh github.com'
@@ -1074,6 +1227,7 @@ case_start 'doctor: an unregistered key is reported with the registration fix'
 reset_world
 give_everything
 give_identity_config
+give_t3_server
 SSH_STUB_GITHUB=unregistered runp --doctor
 rc_is 1
 out_counts 1 'missing: '
@@ -1090,6 +1244,7 @@ case_start 'doctor: an unknown host key resolves to the unregistered verdict, ho
 reset_world
 give_everything
 give_identity_config
+give_t3_server
 SSH_STUB_GITHUB=unknown-host runp --doctor
 rc_is 1
 out_counts 1 'missing: '
@@ -1105,6 +1260,7 @@ case_start 'doctor: an expired key is reported apart from an unregistered one'
 reset_world
 give_everything
 give_identity_config
+give_t3_server
 SSH_STUB_GITHUB=expired runp --doctor
 rc_is 1
 out_counts 1 'missing: '
@@ -1115,6 +1271,77 @@ out_has 'the key is registered but has expired'
 out_hasnt 'cat ~/.ssh/id_devcontainer.pub'
 out_hasnt 'register it at'
 ok 'the expired fix is a sign-in, not another registration'
+
+# ============================================================================
+# The T3 Code server
+# ============================================================================
+
+case_start '--start-t3 starts the server once, detached, and nothing else'
+reset_world
+runp --start-t3
+rc_is 0
+out_has_line 'started: t3 server (port 3774)'
+wait_called "$T3_SERVE"
+log_is "$T3_SERVE"
+ok 'no installs, no provisioning, no doctor: only the start'
+[ -f "$HOMEDIR/.t3/serve.log" ] || die 'no server log at ~/.t3/serve.log'
+ok 'the server writes its log to ~/.t3/serve.log'
+runp --start-t3
+rc_is 0
+out_empty
+called_times 1 't3 serve'
+ok 'a second start while it runs is a no-op: the server holds the lock'
+
+case_start 'a server that stopped is started again'
+reset_world
+runp --start-t3
+rc_is 0
+wait_called "$T3_SERVE"
+kill_servers
+runp --start-t3
+rc_is 0
+out_has_line 'started: t3 server (port 3774)'
+i=0
+while [ "$(calls | grep -cF "$T3_SERVE")" -lt 2 ]; do
+	i=$((i + 1))
+	[ "$i" -le 100 ] || die 'the server was not started a second time'
+	sleep 0.05
+done
+ok 'the lock goes with the server, so a restart is possible'
+
+case_start 'T3_PORT moves the port, and an empty one means the default'
+reset_world
+T3_PORT=3800 runp --start-t3
+rc_is 0
+out_has_line 'started: t3 server (port 3800)'
+wait_called 't3 serve --host 0.0.0.0 --port 3800 /workspace'
+reset_world
+T3_PORT='' runp --start-t3
+rc_is 0
+wait_called "$T3_SERVE"
+ok 'an empty T3_PORT, as a copied env.example leaves it, is the default'
+
+case_start 'a T3_PORT that is not a port fails and starts nothing'
+reset_world
+T3_PORT=abc runp --start-t3
+rc_nonzero
+err_has 'T3_PORT is not a port number: abc'
+log_empty
+reset_world
+T3_PORT=70000 runp --start-t3
+rc_nonzero
+err_has 'T3_PORT is not a port number: 70000'
+log_empty
+
+case_start 'without t3, --start-t3 succeeds quietly: the first start of a fresh home'
+reset_world
+rm -f "$LOCAL_BIN/t3"
+runp --start-t3
+rc_is 0
+out_has_line 't3 server: t3 is not installed yet'
+log_empty
+no_file "$HOMEDIR/.t3"
+ok 'the container still starts; the bootstrap starts the server once t3 is in'
 
 # ============================================================================
 # Exit codes and writes
@@ -1130,8 +1357,9 @@ no_file "$HOMEDIR/.gitconfig"
 # Including the ssh directory: no key, no config, and no known-hosts file — batch
 # mode forbids the one write the probe itself could make.
 no_file "$HOMEDIR/.ssh"
-log_is 'claude --version' 'codex --version' 'herdr --version' 'codex login status' "$PROBE_GITHUB"
-ok 'no install, no integration install, no posture, no git writes, no key generation'
+no_file "$HOMEDIR/.t3"
+log_is 'claude --version' 'codex --version' 'herdr --version' 't3 --version' 'codex login status' "$PROBE_GITHUB"
+ok 'no install, no integration install, no posture, no git writes, no key generation, no server'
 
 case_start 'the default run survives missing credentials'
 reset_world
@@ -1334,6 +1562,12 @@ rc_nonzero
 err_has 'not inside a container'
 log_empty
 ok 'the guard covers --update-tools: nothing installs into a host home either'
+runp --start-t3
+rc_nonzero
+err_has 'not inside a container'
+log_empty
+no_file "$HOMEDIR/.t3"
+ok 'the guard covers --start-t3: no server starts on a host'
 
 # ============================================================================
 # Usage
@@ -1355,6 +1589,13 @@ rc_is 2
 err_has 'mutually exclusive'
 log_empty
 
+case_start '--start-t3 with another mode is refused too'
+reset_world
+runp --start-t3 --doctor
+rc_is 2
+err_has '--doctor and --start-t3 are mutually exclusive'
+log_empty
+
 case_start '--help prints usage on stdout and runs nothing'
 reset_world
 runp --help
@@ -1362,6 +1603,7 @@ rc_is 0
 out_has 'Usage: dev-bootstrap'
 out_has '--doctor'
 out_has '--update-tools'
+out_has '--start-t3'
 log_empty
 no_file "$HOMEDIR/.claude"
 

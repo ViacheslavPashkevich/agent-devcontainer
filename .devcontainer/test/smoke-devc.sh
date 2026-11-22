@@ -2,7 +2,8 @@
 #
 # smoke-devc.sh — the host entry point exercised against the real running
 # container: the fence verbs with their identities, the allowlist push, exec,
-# the doctor, and a stop/up cycle that proves the fence re-arms on every start.
+# the doctor, the T3 Code server as the host sees it, and a stop/up cycle that
+# proves the fence re-arms, and the server comes back, on every start.
 # Where test-devc.sh proves devc issues the right commands, this proves the
 # commands do what the verbs promise.
 #
@@ -97,12 +98,28 @@ case_start 'the doctor sees the host and the container, tools installed through 
 doctor=$("$DEVC" doctor 2>&1)
 printf '%s\n' "$doctor" | grep -q '^ok: container running$'
 check $? 'devc doctor reaches the in-container doctor' "$doctor"
-for tool in claude codex herdr; do
+for tool in claude codex herdr t3; do
 	printf '%s\n' "$doctor" | grep -qE "^ok: $tool( \(|$)"
 	check $? "the bootstrap installed $tool into the home volume" "$doctor"
 done
 printf '%s\n' "$doctor" | grep -q '^ok: herdr ('
 check $? 'herdr reports a version — the installer ran, not just a download'
+printf '%s\n' "$doctor" | grep -q '^ok: t3 server (port '
+check $? 'the t3 server is running' "$doctor"
+
+case_start 'the t3 server answers on the published port'
+cid=$(docker ps -q --filter "label=devcontainer.local_folder=$ROOT" | head -n 1)
+t3_port=$(docker exec "$cid" printenv T3_PORT 2>/dev/null)
+t3_addr=$(docker port "$cid" "${t3_port:-3774}/tcp" | head -n 1)
+[ -n "$t3_addr" ]
+check $? "compose publishes ${t3_port:-3774} (${t3_addr:-not published})"
+# Any HTTP answer will do: pairing is the server's business, reaching it is
+# what the port promises.
+t3_answers() {
+	[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$t3_addr/")" != 000 ]
+}
+t3_answers
+check $? "the server answers over HTTP at $t3_addr"
 
 case_start 'firewall status reports armed on a running container'
 status_says '^enforcement: armed$'
@@ -181,6 +198,12 @@ check $armed 'enforcement: armed after a plain restart — the compose command, 
 inside_reaches "$BLOCKED_HOST"
 [ $? != 0 ]
 check $? "$BLOCKED_HOST is refused after the restart"
+answering=1
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+	t3_answers && answering=0 && break
+	sleep 1
+done
+check $answering 'the t3 server is back after a plain restart — the compose command starts it too'
 
 # ============================================================================
 

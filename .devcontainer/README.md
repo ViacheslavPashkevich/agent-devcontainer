@@ -14,6 +14,7 @@ Configurable firewall included (egress allowlist).
 - A non-root `dev` user. Its home is a named volume, so logins, tools and
   history survive rebuilds. Your project is mounted at `/workspace`.
 - claude, codex and herdr (a terminal multiplexer for agents).
+- A [T3 Code](#t3-code) server, started with the container.
 - python3 (pip, venv), node LTS, git, gh, ssh, curl, jq, ripgrep, fd, tree,
   unzip, file.
 - zsh, nvim and yazi; see
@@ -94,7 +95,8 @@ devc exec dev-bootstrap --update-tools     # from the host
 dev-bootstrap --update-tools               # from inside
 ```
 
-No rebuild needed. Auto-update is off.
+No rebuild needed. Auto-update is off. This updates herdr and t3 too; a
+running t3 server switches to the new version at the next container start.
 
 ## Firewall
 
@@ -132,6 +134,31 @@ Good to know:
   determined attacker. Your shell inside is the same `dev` user the agents
   use, so whatever you can do from inside, they can too.
 
+## T3 Code
+
+A T3 Code server starts with the container, on port 3774, reachable from the
+host only.
+
+To connect the T3 app:
+
+1. Get a pairing link:
+
+   ```bash
+   devc exec t3 pair
+   ```
+
+2. In the link, replace the container's address (such as `172.19.0.2:3774`)
+   with `localhost:3774`, then open it or paste it into the app.
+
+Good to know:
+
+- **Several projects on one host:** give each its own port with `T3_PORT` in
+  `.env`.
+- **From another machine:** set `T3_BIND` in `.env` to an address of the host,
+  such as its Tailnet IP, and use that address in the link.
+- **After changing `.env`,** run `devc rebuild`.
+- **Not running?** `devc doctor` says so and shows where the log is.
+
 ## Customizing
 
 Everything you're expected to edit is marked `project section`. You can change
@@ -143,7 +170,8 @@ the rest too, but upgrades are easier if you don't.
 | `Dockerfile` | base image | `ARG BASE_IMAGE=…`: any Debian-family image. |
 | `Dockerfile` | packages | OS packages. |
 | `Dockerfile` | mount points and environment | `mkdir`+`chown` per volume inside the workspace, plus `ENV`. |
-| `compose.yaml` | the app service | Ports (loopback only), environment, `depends_on`. |
+| `compose.yaml` | ports | Published ports (loopback only). |
+| `compose.yaml` | the app service | Environment, `depends_on`. |
 | `compose.yaml` | services | Databases, caches. Reachable from the container by service name. |
 | `compose.yaml` | mounts / volumes | Named volumes inside the workspace. |
 | `sbin/dev-own-volumes` | `VOLUMES=` | One entry per volume inside the workspace. |
@@ -195,7 +223,8 @@ env.example            what can go in .env
 firewall/allowlist     allowed domains
 sbin/dev-firewall      the firewall (runs as root)
 sbin/dev-own-volumes   fixes volume ownership (runs as root)
-bin/dev-bootstrap      installs the agents, sets up yolo mode, git and ssh
+bin/dev-bootstrap      installs the tools, sets up yolo mode, git and ssh,
+                       starts the t3 server
 host/devc              the host command
 etc/                   zsh, nvim and sudo config
 test/                  tests and smoke checks; see test/README.md

@@ -22,10 +22,12 @@ github.com
 githubusercontent.com
 
 # Where the operator tools come from: the npm registry for claude and codex,
-# herdr's own installer.
+# herdr's own installer, and t3's installer and relay (its releases come from
+# GitHub, above).
 npmjs.org
 npmjs.com
 herdr.dev
+t3.codes
 
 # Python packages: the baseline ships pip, and a fence that blocks the first
 # `pip install` is a trap.

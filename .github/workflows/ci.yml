@@ -70,6 +70,8 @@ jobs:
           echo "$out" | grep -q '^ok: claude (' || exit 1
           echo "$out" | grep -q '^ok: codex (' || exit 1
           echo "$out" | grep -q '^ok: herdr (' || exit 1
+          echo "$out" | grep -q '^ok: t3 (' || exit 1
+          echo "$out" | grep -q '^ok: t3 server (' || exit 1
       - name: Fence smoke (inside, as dev)
         run: .devcontainer/host/devc exec bash .devcontainer/test/smoke-dev-firewall.sh
       - name: devc smoke (host verbs against the running container)

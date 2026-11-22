@@ -14,12 +14,18 @@ services:
     # failure past that first restore leaves egress *closed*, not open;
     # `devc firewall status` is the authority on what is actually enforced,
     # which is why the message below reports rather than asserts.
+    #
+    # The T3 Code server starts here for the same reason, after the arm so it
+    # never runs unfenced. On a fresh home volume t3 is not installed yet; the
+    # bootstrap starts the server once it has installed it.
     command:
       - sh
       - -c
       - >-
         /usr/local/sbin/dev-firewall on
         || echo 'dev-firewall: arming failed — run `devc firewall status` to see what is enforced' >&2;
+        /usr/local/bin/dev-bootstrap --start-t3
+        || echo 'dev-bootstrap: the t3 server did not start — run `devc doctor` to see why' >&2;
         exec sleep infinity
     init: true
     # iptables, ipset and dnsmasq's set feeding need NET_ADMIN; NET_RAW is
@@ -49,13 +55,23 @@ services:
     env_file:
       - path: ./.env
         required: false
+    ports:
+      # The T3 Code server, on the same port inside and out. Loopback unless
+      # .env names another address, such as a Tailnet IP; see env.example.
+      - "${T3_BIND:-127.0.0.1}:${T3_PORT:-3774}:${T3_PORT:-3774}"
+      # --- project section: ports --------------------------------------------
+      #
+      # Loopback only, so nothing on the LAN reaches the dev servers. Ports go
+      # in this list — a second `ports:` key lower down would be a duplicate
+      # YAML rejects. Shape:
+      #
+      # - "127.0.0.1:3000:3000"
+      #
+      # --- end of project section --------------------------------------------
     # --- project section: the app service ----------------------------------
     #
-    # Ports (loopback only, so nothing on the LAN reaches the dev servers),
-    # environment, dependencies on the services below. Shape:
+    # Environment, dependencies on the services below. Shape:
     #
-    # ports:
-    #   - "127.0.0.1:3000:3000"
     # environment:
     #   DATABASE_URL: postgres://postgres:postgres@postgres:5432
     # depends_on:
